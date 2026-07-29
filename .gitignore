@@ -1,0 +1,15 @@
+node_modules/
+dist/
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Contains the Google client secret in plaintext
+scratchpad.md
