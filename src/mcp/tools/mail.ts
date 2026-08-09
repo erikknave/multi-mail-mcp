@@ -23,7 +23,7 @@ import {
   resolveAccounts,
   ServiceError,
 } from '../../service.js';
-import { guard, ok } from '../reply.js';
+import { guard, ok, partial, type AccountProblem } from '../reply.js';
 
 const accountArg = z
   .string()
@@ -150,23 +150,26 @@ export function registerMailTools(server: McpServer, user: User): void {
           .flatMap((r) => r.results.map((m) => ({ account: r.account, ...m })))
           .sort((a, b) => b.internalDate - a.internalDate);
 
-        const failures = perAccount.filter((r) => !r.ok);
+        const problems: AccountProblem[] = perAccount
+          .filter((r) => !r.ok)
+          .map((f) => ({
+            account: f.account,
+            error: f.error ?? 'unknown error',
+            ...('reauthUrl' in f && f.reauthUrl ? { reauthUrl: f.reauthUrl } : {}),
+          }));
 
-        return ok({
-          query,
-          searchedAccounts: targets.map((a) => a.email),
-          totalResults: merged.length,
-          messages: merged,
-          ...(failures.length
-            ? {
-                accountsWithProblems: failures.map((f) => ({
-                  account: f.account,
-                  error: f.error,
-                  ...('reauthUrl' in f ? { reauthUrl: f.reauthUrl } : {}),
-                })),
-              }
-            : {}),
-        });
+        return partial(
+          {
+            query,
+            searchedAccounts: targets.map((a) => a.email),
+            mailboxesSearched: targets.length - problems.length,
+            mailboxesRequested: targets.length,
+            totalResults: merged.length,
+            messages: merged,
+          },
+          problems,
+          'search results',
+        );
       }),
   );
 

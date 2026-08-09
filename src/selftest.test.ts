@@ -7,6 +7,7 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { readFile } from 'node:fs/promises';
 
 process.env.PUBLIC_BASE_URL ??= 'https://example.test';
 process.env.GOOGLE_CLIENT_ID ??= 'test-client-id';
@@ -376,4 +377,106 @@ test('toEventSummary marks all-day events', () => {
 test('toEventSummary supplies a placeholder title for untitled events', () => {
   const e = toEventSummary({ id: 'e3', start: { date: '2026-01-01' }, end: { date: '2026-01-02' } });
   assert.equal(e.summary, '(no title)');
+});
+
+/* ------------------------------------------------------------------ *
+ * Token refresh window
+ * ------------------------------------------------------------------ */
+
+test('our refresh window is wider than google-auth-library\'s eager-refresh threshold', async () => {
+  // The regression this guards: we used to refresh 60s before expiry while the
+  // library eagerly refreshes 5 minutes before. In that band we handed over a
+  // token we thought was fresh, the library decided to renew it, found no
+  // refresh_token on the client, and threw "No refresh token is set." — which
+  // surfaced as an empty result rather than an actionable error.
+  // Read the threshold out of the installed library rather than hard-coding it,
+  // so the test keeps guarding the invariant if the library ever changes it.
+  const libSource = await readFile(
+    new URL('../node_modules/google-auth-library/build/src/auth/authclient.js', import.meta.url),
+    'utf8',
+  );
+  const libMatch = /DEFAULT_EAGER_REFRESH_THRESHOLD_MILLIS = ([\d *]+);/.exec(libSource);
+  assert.ok(libMatch, 'could not read the library\'s eager-refresh threshold');
+  const DEFAULT_EAGER_REFRESH_THRESHOLD_MILLIS = libMatch[1]!
+    .split('*')
+    .map((n) => Number(n.trim()))
+    .reduce((a, b) => a * b, 1);
+
+  const source = await readFile(new URL('./google/oauth.ts', import.meta.url), 'utf8');
+
+  const declared = /const EXPIRY_SKEW = (\d+)/.exec(source);
+  assert.ok(declared, 'EXPIRY_SKEW must be declared in google/oauth.ts');
+
+  const ourSkewMs = Number(declared[1]) * 1000;
+  assert.ok(
+    ourSkewMs > DEFAULT_EAGER_REFRESH_THRESHOLD_MILLIS,
+    `EXPIRY_SKEW (${ourSkewMs}ms) must exceed the library's eager-refresh threshold ` +
+      `(${DEFAULT_EAGER_REFRESH_THRESHOLD_MILLIS}ms), or refreshes race in the gap`,
+  );
+});
+
+test('the client is always given a refresh token alongside the access token', async () => {
+  // Belt to the skew's braces: even if the windows ever cross again, a client
+  // holding a refresh token can renew itself instead of throwing.
+  const source = await readFile(new URL('./google/oauth.ts', import.meta.url), 'utf8');
+  const setCredentialsCalls = source.match(/client\.setCredentials\(\{[\s\S]*?\}\);/g) ?? [];
+
+  assert.ok(setCredentialsCalls.length >= 2, 'expected both the cached and refreshed paths');
+  for (const call of setCredentialsCalls) {
+    assert.match(
+      call,
+      /refresh_token/,
+      `every setCredentials call must pass refresh_token, found one without:\n${call}`,
+    );
+  }
+});
+
+test('a missing-refresh-token error is classified as needing re-authentication', async () => {
+  const source = await readFile(new URL('./google/oauth.ts', import.meta.url), 'utf8');
+  const classifier = /const looksLikeAuthFailure =[\s\S]*?;\n/.exec(source);
+  assert.ok(classifier, 'auth-failure classifier must exist');
+  assert.match(
+    classifier[0],
+    /no refresh token is set/i,
+    'the classifier must recognise the library\'s missing-refresh-token error, ' +
+      'otherwise it passes through as an anonymous failure',
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * Partial-failure reporting
+ * ------------------------------------------------------------------ */
+
+test('a partial result leads with an unmissable incomplete flag', async () => {
+  const { partial } = await import('./mcp/reply.js');
+
+  const result = partial(
+    { query: 'is:inbox', totalResults: 0, messages: [] },
+    [{ account: 'a@x.com', error: 'needs_reauth', reauthUrl: 'https://example.test/reauth/x' }],
+    'search results',
+  );
+
+  const payload = JSON.parse((result.content[0] as { text: string }).text);
+  const keys = Object.keys(payload);
+
+  assert.equal(payload.incomplete, true);
+  assert.equal(keys[0], 'incomplete', 'the flag must come first so a skimming reader sees it');
+  assert.equal(keys[1], 'warning', 'the explanation must come second');
+  assert.match(payload.warning, /INCOMPLETE RESULT/);
+  assert.match(payload.warning, /a@x\.com/, 'the affected mailbox must be named');
+  assert.match(payload.warning, /renew access/, 'a reauth-able failure must say so');
+  // The zero-result trap: totalResults 0 must never be readable as "nothing found".
+  assert.equal(payload.totalResults, 0);
+  assert.equal(payload.accountsWithProblems.length, 1);
+});
+
+test('a fully successful result states plainly that it is complete', async () => {
+  const { partial } = await import('./mcp/reply.js');
+
+  const result = partial({ totalResults: 3, messages: [1, 2, 3] }, [], 'search results');
+  const payload = JSON.parse((result.content[0] as { text: string }).text);
+
+  assert.equal(payload.incomplete, false);
+  assert.ok(!('warning' in payload));
+  assert.ok(!('accountsWithProblems' in payload));
 });

@@ -9,6 +9,49 @@ export function ok(data: unknown): CallToolResult {
   };
 }
 
+export interface AccountProblem {
+  account: string;
+  error: string;
+  reauthUrl?: string;
+}
+
+/**
+ * Wraps the result of an operation that ran across several mailboxes.
+ *
+ * A partial failure used to look exactly like a genuine empty result: the tool
+ * returned `totalResults: 0` with the failure tucked away in a trailing field.
+ * A caller that didn't think to read that field would conclude "nothing found"
+ * when the truth was "we couldn't look".
+ *
+ * So when anything failed, the payload leads with `incomplete: true` and a
+ * plain-language warning, both placed first in key order — a reader that only
+ * skims the top of the object still cannot miss it.
+ */
+export function partial<T extends Record<string, unknown>>(
+  data: T,
+  problems: AccountProblem[],
+  what: string,
+): CallToolResult {
+  if (problems.length === 0) {
+    return ok({ ...data, incomplete: false });
+  }
+
+  const names = problems.map((p) => p.account).join(', ');
+  const needReauth = problems.filter((p) => p.reauthUrl);
+
+  const warning =
+    `INCOMPLETE RESULT — ${problems.length} of the requested mailboxes could not be ` +
+    `searched, so this is not the full picture. Do not report these ${what} as complete, ` +
+    `and do not conclude that something is absent from mail you could not read. ` +
+    `Affected: ${names}.` +
+    (needReauth.length
+      ? ` ${needReauth.length} ${needReauth.length === 1 ? 'needs' : 'need'} the user to ` +
+        `renew access via the reauthUrl below.`
+      : '');
+
+  return ok({ incomplete: true, warning, ...data, accountsWithProblems: problems });
+}
+
 export function text(message: string): CallToolResult {
   return { content: [{ type: 'text', text: message }] };
 }

@@ -13,7 +13,7 @@ import {
 } from '../../google/calendar.js';
 import { ReauthRequiredError } from '../../google/oauth.js';
 import { calendarClient, resolveAccount, resolveAccounts } from '../../service.js';
-import { guard, ok } from '../reply.js';
+import { guard, ok, partial, type AccountProblem } from '../reply.js';
 
 const accountArg = z
   .string()
@@ -67,7 +67,15 @@ export function registerCalendarTools(server: McpServer, user: User): void {
             }
           }),
         );
-        return ok({ accounts: results });
+        const problems: AccountProblem[] = results
+          .filter((r) => 'error' in r && r.error)
+          .map((r) => ({
+            account: r.account,
+            error: (r as { error: string }).error,
+            ...('reauthUrl' in r && r.reauthUrl ? { reauthUrl: r.reauthUrl as string } : {}),
+          }));
+
+        return partial({ accounts: results }, problems, 'calendars');
       }),
   );
 
@@ -134,23 +142,26 @@ export function registerCalendarTools(server: McpServer, user: User): void {
           .flatMap((r) => r.events.map((e) => ({ account: r.account, calendarId, ...e })))
           .sort((a, b) => (a.start ?? '').localeCompare(b.start ?? ''));
 
-        const failures = perAccount.filter((r) => !r.ok);
+        const problems: AccountProblem[] = perAccount
+          .filter((r) => !r.ok)
+          .map((f) => ({
+            account: f.account,
+            error: f.error ?? 'unknown error',
+            ...('reauthUrl' in f && f.reauthUrl ? { reauthUrl: f.reauthUrl } : {}),
+          }));
 
-        return ok({
-          timeMin,
-          timeMax,
-          eventCount: merged.length,
-          events: merged,
-          ...(failures.length
-            ? {
-                accountsWithProblems: failures.map((f) => ({
-                  account: f.account,
-                  error: f.error,
-                  ...('reauthUrl' in f ? { reauthUrl: f.reauthUrl } : {}),
-                })),
-              }
-            : {}),
-        });
+        return partial(
+          {
+            timeMin,
+            timeMax,
+            calendarsRead: targets.length - problems.length,
+            calendarsRequested: targets.length,
+            eventCount: merged.length,
+            events: merged,
+          },
+          problems,
+          'events',
+        );
       }),
   );
 
@@ -368,7 +379,19 @@ export function registerCalendarTools(server: McpServer, user: User): void {
           }),
         );
 
-        return ok({ timeMin, timeMax, calendars: ids, accounts: results });
+        const problems: AccountProblem[] = results
+          .filter((r) => 'error' in r && r.error)
+          .map((r) => ({
+            account: r.account,
+            error: (r as { error: string }).error,
+            ...('reauthUrl' in r && r.reauthUrl ? { reauthUrl: r.reauthUrl as string } : {}),
+          }));
+
+        return partial(
+          { timeMin, timeMax, calendars: ids, accounts: results },
+          problems,
+          'busy intervals',
+        );
       }),
   );
 }

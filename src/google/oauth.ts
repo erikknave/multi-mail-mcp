@@ -243,17 +243,59 @@ async function refreshAccessToken(
   };
 }
 
-/** Refresh a minute before actual expiry so an in-flight call never races it. */
-const EXPIRY_SKEW = 60;
+/**
+ * How long before actual expiry we refresh a cached access token ourselves.
+ *
+ * This MUST stay above google-auth-library's own eager-refresh threshold
+ * (`DEFAULT_EAGER_REFRESH_THRESHOLD_MILLIS`, 5 minutes). If our window is the
+ * narrower one, there is a band where we hand the library a token we consider
+ * fresh but it considers due for renewal — it then tries to refresh on our
+ * behalf and fails. Ten minutes keeps our controlled path comfortably first.
+ */
+const EXPIRY_SKEW = 600;
 
 /**
  * Returns an OAuth2Client with a live access token for the account, refreshing
  * transparently when needed.
  *
+ * The client is always given the refresh token as well as the access token.
+ * Without it, any refresh the library decides to perform itself dies with
+ * "No refresh token is set." — which surfaces as an opaque failure rather than
+ * an actionable one. With it, a library-initiated refresh simply works, and the
+ * `tokens` listener persists whatever it obtains so the next call reuses it.
+ *
  * @throws ReauthRequiredError when the grant is dead and only a human can fix it.
  */
 export async function getAuthorizedClient(account: Account): Promise<OAuth2Client> {
   const client = newOAuthClient();
+
+  let refreshToken: string | null = null;
+  if (account.refresh_token_enc) {
+    try {
+      refreshToken = decrypt(account.refresh_token_enc);
+    } catch {
+      // Treated as a dead grant below; a token we cannot read is a token we do
+      // not have.
+      refreshToken = null;
+    }
+  }
+
+  if (refreshToken) {
+    // Persist anything the library refreshes on its own initiative, so a
+    // library-side renewal doesn't get thrown away at the end of the request.
+    client.on('tokens', (tokens) => {
+      if (!tokens.access_token) return;
+      try {
+        accounts.updateAccessToken(
+          account.id,
+          encrypt(tokens.access_token),
+          tokens.expiry_date ? Math.floor(tokens.expiry_date / 1000) : now() + 3500,
+        );
+      } catch (err) {
+        console.error(`[oauth] could not persist refreshed token for ${account.email}`, err);
+      }
+    });
+  }
 
   const cached =
     account.access_token_enc && account.access_token_expires
@@ -265,6 +307,7 @@ export async function getAuthorizedClient(account: Account): Promise<OAuth2Clien
       client.setCredentials({
         access_token: decrypt(cached.token),
         expiry_date: cached.expires * 1000,
+        ...(refreshToken ? { refresh_token: refreshToken } : {}),
       });
       return client;
     } catch {
@@ -293,6 +336,7 @@ export async function getAuthorizedClient(account: Account): Promise<OAuth2Clien
   client.setCredentials({
     access_token: result.accessToken,
     expiry_date: result.expiresAt * 1000,
+    ...(refreshToken ? { refresh_token: refreshToken } : {}),
   });
   return client;
 }
@@ -307,9 +351,15 @@ export function rethrowAsReauthIfNeeded(err: unknown, account: Account): never {
   const status = e?.code ?? e?.status ?? e?.response?.status;
   const message = e?.message ?? String(err);
 
+  // "No refresh token is set." comes from google-auth-library when it tries to
+  // renew a token it was handed without a refresh token. Reaching it means the
+  // stored grant is unusable, so treat it as needing re-authentication rather
+  // than letting it pass through as an anonymous failure.
   const looksLikeAuthFailure =
     status === 401 ||
-    /invalid_grant|invalid credentials|token has been expired or revoked/i.test(message);
+    /invalid_grant|invalid credentials|token has been expired or revoked|no refresh token is set|no access, refresh token/i.test(
+      message,
+    );
 
   if (looksLikeAuthFailure) {
     accounts.markNeedsReauth(account.id, message);
