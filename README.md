@@ -203,27 +203,51 @@ mailbox has to be reconnected.
 
 ## Running it as a service
 
+Run it under systemd, not from a shell. A process started with `nohup ... &` is
+a child of that shell's process group and dies with it — which looks exactly
+like a crash, except the log ends with a clean `Received SIGTERM`.
+
+A **user** service is enough; no root required:
+
 ```ini
-# /etc/systemd/system/multi-mail-mcp.service
+# ~/.config/systemd/user/multi-mail-mcp.service
 [Unit]
-Description=multi-mail-mcp
+Description=multi-mail-mcp — Gmail/Calendar MCP server
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=youruser
 WorkingDirectory=/path/to/multi-mail-mcp
 ExecStart=/usr/bin/node dist/index.js
 Restart=always
 RestartSec=5
+# Give SQLite a moment to flush its WAL on stop.
+TimeoutStopSec=15
+SyslogIdentifier=multi-mail-mcp
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 ```
 
 ```bash
-sudo systemctl enable --now multi-mail-mcp
+systemctl --user daemon-reload
+systemctl --user enable --now multi-mail-mcp
+
+# Required so the service keeps running when you log out, and starts at boot:
+sudo loginctl enable-linger "$USER"
 ```
+
+Day to day:
+
+```bash
+systemctl --user status multi-mail-mcp
+systemctl --user restart multi-mail-mcp        # after a rebuild
+journalctl --user -u multi-mail-mcp -f         # follow the log
+```
+
+`WorkingDirectory` is what lets the process find `.env` and `data/`, so it must
+point at the checkout.
 
 ---
 
