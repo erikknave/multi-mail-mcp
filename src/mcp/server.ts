@@ -4,6 +4,8 @@ import { registerAccountTools } from './tools/accounts.js';
 import { registerMailTools } from './tools/mail.js';
 import { registerCalendarTools } from './tools/calendar.js';
 import { registerDriveTools } from './tools/drive.js';
+import { registerSheetsTools } from './tools/sheets.js';
+import { registerDocsTools } from './tools/docs.js';
 import { registerFileTools } from './tools/files.js';
 
 /**
@@ -26,6 +28,10 @@ export function buildMcpServer(user: User): McpServer {
         '`get_message` or `get_thread` for the full text.\n\n' +
         'Drive search uses Drive query syntax, which is different from Gmail\'s — see the ' +
         'search_drive description for the forms.\n\n' +
+        'Spreadsheets and Google Docs must be edited with their own tools. Never use ' +
+        'write_drive_file on one: it replaces the entire file, destroying every other tab ' +
+        'of a workbook. Use write_sheet_range and append_to_doc instead, and ' +
+        'duplicate_sheet_tab to copy a tab with its formatting intact.\n\n' +
         'Results that span several accounts carry an `incomplete` flag. When it is true, ' +
         'some account could not be read: say so rather than reporting the result as ' +
         'complete, and never conclude that something is absent from a mailbox or Drive you ' +
@@ -39,6 +45,8 @@ export function buildMcpServer(user: User): McpServer {
   registerMailTools(server, user);
   registerCalendarTools(server, user);
   registerDriveTools(server, user);
+  registerSheetsTools(server, user);
+  registerDocsTools(server, user);
   registerFileTools(server, user);
 
   return server;

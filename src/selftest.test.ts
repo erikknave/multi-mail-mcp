@@ -602,3 +602,155 @@ test('Drive is part of the requested scope set', async () => {
     'consent must request the Drive scope, or no account can ever grant it',
   );
 });
+
+/* ------------------------------------------------------------------ *
+ * Sheets A1 notation
+ * ------------------------------------------------------------------ */
+
+test('column letters convert to indices and back', async () => {
+  const { columnToIndex, indexToColumn } = await import('./google/sheets.js');
+  const cases: Array<[string, number]> = [['A', 0], ['B', 1], ['Z', 25], ['AA', 26], ['AB', 27], ['BA', 52], ['ZZ', 701], ['AAA', 702]];
+  for (const [letters, index] of cases) {
+    assert.equal(columnToIndex(letters), index, `${letters} should be ${index}`);
+    assert.equal(indexToColumn(index), letters, `${index} should be ${letters}`);
+  }
+});
+
+test('A1 ranges become the half-open zero-based indices GridRange needs', async () => {
+  const { parseA1 } = await import('./google/sheets.js');
+
+  // The classic off-by-one: B2:D10 is rows 1..10 and columns 1..4, because the
+  // start is inclusive and zero-based while the end is exclusive.
+  assert.deepEqual(parseA1('Sheet1!B2:D10'), {
+    tabName: 'Sheet1', startRowIndex: 1, endRowIndex: 10, startColumnIndex: 1, endColumnIndex: 4,
+  });
+
+  // A single cell is a one-by-one range, not an unbounded one.
+  assert.deepEqual(parseA1('B2'), {
+    tabName: null, startRowIndex: 1, endRowIndex: 2, startColumnIndex: 1, endColumnIndex: 2,
+  });
+});
+
+test('A1 handles quoted tab names with spaces', async () => {
+  const { parseA1 } = await import('./google/sheets.js');
+  assert.equal(parseA1("'Jul 2026'!A1:F1").tabName, 'Jul 2026');
+  assert.equal(parseA1('Jul 2026!A1').tabName, 'Jul 2026');
+  // A doubled quote inside a quoted name is an escaped single quote.
+  assert.equal(parseA1("'Erik''s tab'!A1").tabName, "Erik's tab");
+});
+
+test('A1 handles whole-column, whole-row and whole-tab ranges', async () => {
+  const { parseA1 } = await import('./google/sheets.js');
+
+  // Whole columns: rows must stay unbounded, not default to 0.
+  const cols = parseA1('A:C');
+  assert.equal(cols.startColumnIndex, 0);
+  assert.equal(cols.endColumnIndex, 3);
+  assert.equal(cols.startRowIndex, undefined, 'rows must remain unbounded');
+  assert.equal(cols.endRowIndex, undefined);
+
+  const rows = parseA1('2:5');
+  assert.equal(rows.startRowIndex, 1);
+  assert.equal(rows.endRowIndex, 5);
+  assert.equal(rows.startColumnIndex, undefined, 'columns must remain unbounded');
+
+  // A bare unquoted string that is not a cell reference names the whole tab.
+  assert.deepEqual(parseA1('Jun 2026'), { tabName: 'Jun 2026' });
+  assert.deepEqual(parseA1('Log'), { tabName: 'Log' });
+  // "Sheet1" is a tab name, not column SHEET row 1.
+  assert.deepEqual(parseA1('Sheet1'), { tabName: 'Sheet1' });
+  // ...but something that IS a valid cell reference still means that cell.
+  assert.equal(parseA1('A1').tabName, null);
+  assert.equal(parseA1('A1').startRowIndex, 0);
+
+  const wholeTab = parseA1('Sheet1!');
+  assert.equal(wholeTab.tabName, 'Sheet1');
+  assert.equal(wholeTab.startRowIndex, undefined);
+});
+
+test('A1 rejects nonsense rather than guessing', async () => {
+  const { parseA1 } = await import('./google/sheets.js');
+  assert.throws(() => parseA1('Sheet1!A1:!!'), /Could not understand/);
+});
+
+test('hex colours convert to the API\'s 0..1 floats', async () => {
+  const { hexToColor } = await import('./google/sheets.js');
+
+  assert.deepEqual(hexToColor('#ffffff'), { red: 1, green: 1, blue: 1 });
+  assert.deepEqual(hexToColor('000000'), { red: 0, green: 0, blue: 0 });
+
+  const blue = hexToColor('#1a73e8');
+  assert.ok(Math.abs(blue.red! - 26 / 255) < 1e-9);
+  assert.ok(Math.abs(blue.green! - 115 / 255) < 1e-9);
+  assert.ok(Math.abs(blue.blue! - 232 / 255) < 1e-9);
+
+  assert.throws(() => hexToColor('#fff'), /six-digit hex/);
+  assert.throws(() => hexToColor('not a colour'), /six-digit hex/);
+});
+
+test('formatting only touches the properties that were supplied', async () => {
+  // An over-broad fields mask silently resets styling the caller never mentioned,
+  // so the mask must be built from the supplied properties alone.
+  const source = await readFile(new URL('./google/sheets.ts', import.meta.url), 'utf8');
+  assert.match(source, /fields: fields\.join\(','\)/, 'the mask must be assembled, not hard-coded');
+  assert.doesNotMatch(
+    source,
+    /fields: '\*'|fields: 'userEnteredFormat'/,
+    'a wildcard mask would wipe unspecified formatting',
+  );
+});
+
+test('a spreadsheet is never written through the Drive blob path', async () => {
+  const source = await readFile(new URL('./google/sheets.ts', import.meta.url), 'utf8');
+  // Everything structural must go through batchUpdate or values.*, never a
+  // whole-file media upload, which is what destroys other tabs.
+  assert.doesNotMatch(source, /files\.update|files\.create/, 'Sheets edits must not use the Drive file API');
+  assert.match(source, /spreadsheets\.values\.update/);
+  assert.match(source, /duplicateSheet/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Docs
+ * ------------------------------------------------------------------ */
+
+test('appending to a Doc inserts before the final newline', async () => {
+  // Inserting at the reported endIndex is rejected by the API; it must be one
+  // less. This is the most common Docs insertion failure.
+  const source = await readFile(new URL('./google/docs.ts', import.meta.url), 'utf8');
+  assert.match(source, /end - 1/, 'insertion index must step back off the trailing newline');
+  assert.match(source, /Math\.max\(1,/, 'index must never fall below 1');
+});
+
+test('a heading is inserted and styled in a single batch', async () => {
+  const source = await readFile(new URL('./google/docs.ts', import.meta.url), 'utf8');
+  const batch = /appendHeading[\s\S]*?\n}/.exec(source);
+  assert.ok(batch);
+  assert.match(batch[0], /insertText/);
+  assert.match(batch[0], /namedStyleType/, 'a real heading style, not just bold text');
+  assert.equal(
+    (batch[0].match(/batchUpdate/g) ?? []).length,
+    1,
+    'one batch, so the document is never left with an unstyled paragraph',
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * Disabled-API detection
+ * ------------------------------------------------------------------ */
+
+test('a disabled Google API is reported as a project setting, not a permission problem', async () => {
+  const { apiDisabledMessage } = await import('./service.js');
+
+  const real =
+    'Google Sheets API has not been used in project 123456 before or it is disabled. ' +
+    'Enable it by visiting https://console.developers.google.com/apis/api/sheets.googleapis.com/overview?project=123456 then retry.';
+
+  const msg = apiDisabledMessage(real);
+  assert.ok(msg, 'the disabled-API case must be recognised');
+  assert.match(msg, /sheets API is not enabled/i);
+  assert.match(msg, /no account needs to\s+sign in again/i, 'must not send the user through re-auth');
+  assert.match(msg, /console\.developers\.google\.com/, 'must carry the enable link');
+
+  assert.equal(apiDisabledMessage('Some other failure'), null, 'unrelated errors pass through');
+  assert.equal(apiDisabledMessage(new Error('invalid_grant')), null);
+});

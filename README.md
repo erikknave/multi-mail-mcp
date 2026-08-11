@@ -2,7 +2,8 @@
 
 An MCP server that gives an AI agent access to **several Gmail / Google Workspace
 accounts at once** — searching and reading mail, reading and updating calendars,
-reading and writing Google Drive, and moving attachments in and out.
+reading and writing Google Drive, editing Sheets and Docs in place, and moving
+attachments in and out.
 
 Runs as a single Node process with a SQLite database and a small web UI.
 
@@ -118,6 +119,15 @@ past 100 users.
 `trash_drive_file`, `restore_drive_file`, `get_drive_permissions`,
 `share_drive_file`, `unshare_drive_file`, `get_drive_usage`
 
+**Sheets** — `list_sheet_tabs`, `duplicate_sheet_tab`, `add_sheet_tab`,
+`rename_sheet_tab`, `delete_sheet_tab`, `reorder_sheet_tab`, `read_sheet_range`,
+`write_sheet_range`, `append_sheet_rows`, `clear_sheet_range`,
+`format_sheet_range`, `auto_resize_sheet_columns`, `set_sheet_layout`,
+`create_spreadsheet`
+
+**Docs** — `read_doc`, `append_to_doc`, `append_doc_heading`, `replace_doc_text`,
+`create_doc`
+
 **Attachments** — `create_upload_url`, `list_uploads`
 
 Most tools take an optional `account` argument naming the mailbox. Omit it when
@@ -161,6 +171,30 @@ The server cannot create "anyone with the link" access, because a mistakenly
 public file is hard to notice afterwards. It *can* remove such a permission —
 `get_drive_permissions` flags a publicly reachable file and `unshare_drive_file`
 revokes it.
+
+### Sheets and Docs
+
+**Never edit a spreadsheet or document through `write_drive_file`.** Drive treats
+a file as one opaque blob, so writing to it replaces the whole thing — on a
+workbook that destroys every other tab. Structured edits go through the Sheets
+and Docs APIs instead:
+
+- `write_sheet_range` writes cells and leaves the rest of the workbook alone.
+- `duplicate_sheet_tab` copies a tab with its formatting, formulas, conditional
+  formatting, column widths and frozen rows intact — the right way to start a
+  new month from the last one. Clear the carried-over values with
+  `clear_sheet_range`, which keeps the formatting.
+- `append_to_doc` and `replace_doc_text` edit a document in place.
+
+Both APIs are authorised by the **same Drive scope**, so enabling them needs no
+new consent. They do need switching on once in the Cloud project:
+[Sheets API](https://console.cloud.google.com/apis/library/sheets.googleapis.com) ·
+[Docs API](https://console.cloud.google.com/apis/library/docs.googleapis.com).
+Until then the tools say exactly that, with the link — they do not send anyone
+through a pointless re-authentication.
+
+Ranges use A1 notation (`'Jul 2026'!B2:F40`). A bare name such as `Jun 2026` or
+`Sheet1` means the whole tab; `A1` means that cell.
 
 ### Attachments
 

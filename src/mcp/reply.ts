@@ -1,6 +1,6 @@
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { ReauthRequiredError, ScopeMissingError } from '../google/oauth.js';
-import { ServiceError } from '../service.js';
+import { apiDisabledMessage, ServiceError } from '../service.js';
 
 /** JSON payload as the tool's text content, pretty-printed for readability. */
 export function ok(data: unknown): CallToolResult {
@@ -92,6 +92,9 @@ export async function guard(fn: () => Promise<CallToolResult>): Promise<CallTool
     if (err instanceof ServiceError) {
       return fail(err.message);
     }
+
+    const disabled = apiDisabledMessage(err);
+    if (disabled) return fail(`ACTION REQUIRED — ${disabled}`);
 
     const e = err as { message?: string; errors?: Array<{ message?: string }> };
     const detail = e?.errors?.[0]?.message ?? e?.message ?? String(err);

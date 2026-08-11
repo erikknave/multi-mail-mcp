@@ -3,13 +3,15 @@ import { unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import type { calendar_v3, drive_v3, gmail_v1 } from 'googleapis';
+import type { calendar_v3, docs_v1, drive_v3, gmail_v1, sheets_v4 } from 'googleapis';
 import { config } from './config.js';
 import { randomId, signToken, verifyToken } from './crypto.js';
 import { now } from './db/index.js';
 import { accounts, uploads, type Account, type Upload, type User } from './db/repo.js';
 import { calendarFor } from './google/calendar.js';
+import { docsFor } from './google/docs.js';
 import { driveFor } from './google/drive.js';
+import { sheetsFor } from './google/sheets.js';
 import { gmailFor } from './google/gmail.js';
 import {
   buildReauthUrl,
@@ -98,6 +100,41 @@ export async function driveClient(account: Account): Promise<drive_v3.Drive> {
   // precise "extend the permission" message instead of an opaque 403.
   requireCapability(account, 'drive');
   return driveFor(await getAuthorizedClient(account));
+}
+
+// Sheets and Docs are separate APIs but are authorised by the same Drive scope,
+// so no additional consent is involved — only the project-level enablement that
+// apiDisabledMessage explains when it is missing.
+export async function sheetsClient(account: Account): Promise<sheets_v4.Sheets> {
+  requireCapability(account, 'drive');
+  return sheetsFor(await getAuthorizedClient(account));
+}
+
+export async function docsClient(account: Account): Promise<docs_v1.Docs> {
+  requireCapability(account, 'drive');
+  return docsFor(await getAuthorizedClient(account));
+}
+
+/**
+ * Google answers a call to an API that is switched off in the Cloud project
+ * with a 403 whose text buries the fix in a wall of prose. Recognise it and
+ * return the one action that resolves it, or the agent reports a permission
+ * problem the user cannot act on.
+ */
+export function apiDisabledMessage(err: unknown): string | null {
+  const message = (err as { message?: string })?.message ?? String(err);
+  if (!/has not been used in project|is disabled|SERVICE_DISABLED/i.test(message)) return null;
+
+  const api = /\b([a-z]+)\.googleapis\.com/i.exec(message)?.[1] ?? 'the required';
+  const url = /https:\/\/console\.[^\s]+/.exec(message)?.[0]?.replace(/[.,]$/, '');
+
+  return (
+    `The Google ${api} API is not enabled in the Cloud project, so this cannot work yet. ` +
+    `This is a one-off project setting, not a permission problem — no account needs to ` +
+    `sign in again.\n\n` +
+    `Ask the user to open ${url ?? 'the Google Cloud console'} and click Enable, then wait ` +
+    `a minute and retry.`
+  );
 }
 
 /**
