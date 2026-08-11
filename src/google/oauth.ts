@@ -1,6 +1,6 @@
 import { google } from 'googleapis';
 import type { OAuth2Client } from 'google-auth-library';
-import { config, GOOGLE_SCOPES } from '../config.js';
+import { config, GOOGLE_SCOPES, SCOPE_FOR, type Capability } from '../config.js';
 import { decrypt, encrypt, signToken, verifyToken } from '../crypto.js';
 import { accounts, audit, type Account } from '../db/repo.js';
 import { now } from '../db/index.js';
@@ -26,6 +26,43 @@ export class ReauthRequiredError extends Error {
     this.accountEmail = accountEmail;
     this.reauthUrl = reauthUrl;
     this.reason = reason;
+  }
+}
+
+/**
+ * Thrown when the account's grant is alive but predates a capability we now
+ * need — for example a mailbox connected before Drive support existed. Google
+ * answers those calls with an opaque 403, so we detect the gap up front and
+ * tell the user exactly what to do about it.
+ */
+export class ScopeMissingError extends Error {
+  readonly accountEmail: string;
+  readonly capability: Capability;
+  readonly reauthUrl: string;
+
+  constructor(accountEmail: string, capability: Capability, reauthUrl: string) {
+    super(
+      `${accountEmail} has not granted ${capability} access. It was connected before this ` +
+        `capability existed, so its permission needs extending. Ask the user to open this ` +
+        `link and approve: ${reauthUrl}`,
+    );
+    this.name = 'ScopeMissingError';
+    this.accountEmail = accountEmail;
+    this.capability = capability;
+    this.reauthUrl = reauthUrl;
+  }
+}
+
+/** Whether the stored grant covers a capability. */
+export function hasCapability(account: Account, capability: Capability): boolean {
+  const granted = (account.scopes ?? '').split(/\s+/).filter(Boolean);
+  return granted.includes(SCOPE_FOR[capability]);
+}
+
+/** @throws ScopeMissingError when the account cannot do this yet. */
+export function requireCapability(account: Account, capability: Capability): void {
+  if (!hasCapability(account, capability)) {
+    throw new ScopeMissingError(account.email, capability, buildReauthUrl(account));
   }
 }
 
@@ -355,6 +392,16 @@ export function rethrowAsReauthIfNeeded(err: unknown, account: Account): never {
   // renew a token it was handed without a refresh token. Reaching it means the
   // stored grant is unusable, so treat it as needing re-authentication rather
   // than letting it pass through as an anonymous failure.
+  // A 403 about scope means the grant is alive but too narrow — re-consent
+  // fixes it, and it must not be mistaken for a revoked token.
+  if (/insufficient (authentication )?scopes?|insufficientPermissions|request had insufficient/i.test(message)) {
+    throw new ReauthRequiredError(
+      account.email,
+      buildReauthUrl(account),
+      `${message} — the account needs to grant the newer permissions.`,
+    );
+  }
+
   const looksLikeAuthFailure =
     status === 401 ||
     /invalid_grant|invalid credentials|token has been expired or revoked|no refresh token is set|no access, refresh token/i.test(

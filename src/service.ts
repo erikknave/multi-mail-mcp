@@ -3,17 +3,19 @@ import { unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import type { calendar_v3, gmail_v1 } from 'googleapis';
+import type { calendar_v3, drive_v3, gmail_v1 } from 'googleapis';
 import { config } from './config.js';
 import { randomId, signToken, verifyToken } from './crypto.js';
 import { now } from './db/index.js';
 import { accounts, uploads, type Account, type Upload, type User } from './db/repo.js';
 import { calendarFor } from './google/calendar.js';
+import { driveFor } from './google/drive.js';
 import { gmailFor } from './google/gmail.js';
 import {
   buildReauthUrl,
   getAuthorizedClient,
   ReauthRequiredError,
+  requireCapability,
   rethrowAsReauthIfNeeded,
 } from './google/oauth.js';
 
@@ -82,11 +84,20 @@ export function resolveAccounts(user: User, emails?: string[]): Account[] {
 }
 
 export async function gmailClient(account: Account): Promise<gmail_v1.Gmail> {
+  requireCapability(account, 'gmail');
   return gmailFor(await getAuthorizedClient(account));
 }
 
 export async function calendarClient(account: Account): Promise<calendar_v3.Calendar> {
+  requireCapability(account, 'calendar');
   return calendarFor(await getAuthorizedClient(account));
+}
+
+export async function driveClient(account: Account): Promise<drive_v3.Drive> {
+  // Checked before the call so an account connected before Drive support gets a
+  // precise "extend the permission" message instead of an opaque 403.
+  requireCapability(account, 'drive');
+  return driveFor(await getAuthorizedClient(account));
 }
 
 /**
@@ -169,6 +180,49 @@ export function buildDownloadUrl(params: {
 
 export function parseDownloadToken(token: string): DownloadPayload | null {
   return verifyToken<DownloadPayload>(token, 'dl');
+}
+
+/* ------------------------------------------------------------------ *
+ * Signed Drive download URLs
+ * ------------------------------------------------------------------ */
+
+interface DriveDownloadPayload extends Record<string, unknown> {
+  k: 'dd';
+  exp: number;
+  uid: string;
+  aid: string;
+  fid: string;
+  fn: string;
+  /** Export target for Google-native files; empty for ordinary binaries. */
+  ex: string;
+}
+
+export function buildDriveDownloadUrl(params: {
+  user: User;
+  account: Account;
+  fileId: string;
+  filename: string;
+  exportMimeType?: string;
+}): { url: string; expiresAt: string } {
+  const exp = now() + config.downloadUrlTtl;
+  const token = signToken({
+    k: 'dd',
+    exp,
+    uid: params.user.id,
+    aid: params.account.id,
+    fid: params.fileId,
+    fn: params.filename,
+    ex: params.exportMimeType ?? '',
+  } satisfies DriveDownloadPayload);
+
+  return {
+    url: `${config.publicBaseUrl}/files/drive/${token}`,
+    expiresAt: new Date(exp * 1000).toISOString(),
+  };
+}
+
+export function parseDriveDownloadToken(token: string): DriveDownloadPayload | null {
+  return verifyToken<DriveDownloadPayload>(token, 'dd');
 }
 
 /* ------------------------------------------------------------------ *

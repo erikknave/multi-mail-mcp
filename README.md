@@ -2,7 +2,7 @@
 
 An MCP server that gives an AI agent access to **several Gmail / Google Workspace
 accounts at once** — searching and reading mail, reading and updating calendars,
-and downloading and uploading attachments.
+reading and writing Google Drive, and moving attachments in and out.
 
 Runs as a single Node process with a SQLite database and a small web UI.
 
@@ -112,6 +112,12 @@ past 100 users.
 **Calendar** — `list_calendars`, `list_events`, `get_event`, `create_event`,
 `update_event`, `delete_event`, `respond_to_event`, `find_free_time`
 
+**Drive** — `search_drive`, `read_drive_file`, `list_drive_folder`,
+`get_drive_download_url`, `upload_to_drive`, `write_drive_file`,
+`create_drive_folder`, `update_drive_file`, `copy_drive_file`,
+`trash_drive_file`, `restore_drive_file`, `get_drive_permissions`,
+`share_drive_file`, `unshare_drive_file`, `get_drive_usage`
+
 **Attachments** — `create_upload_url`, `list_uploads`
 
 Most tools take an optional `account` argument naming the mailbox. Omit it when
@@ -126,6 +132,35 @@ Search results deliberately carry no attachment flag: Gmail's `metadata` format
 returns headers but not the MIME part tree, so any such field could only ever be
 wrong. Filter with the `has:attachment` operator in the query instead — it runs
 server-side and costs nothing.
+
+### Drive
+
+Drive search uses **Drive query syntax**, which is not Gmail's:
+
+```
+name contains 'invoice' and mimeType = 'application/pdf'
+fullText contains 'quarterly report'
+modifiedTime > '2026-01-01T00:00:00'
+'<folderId>' in parents
+```
+
+Three behaviours worth knowing:
+
+- **Google Docs, Sheets and Slides hold no bytes.** They are exported on the
+  way out — to Markdown, CSV and plain text when read as text, and to .docx,
+  .xlsx and .pptx when downloaded. Asking for the "raw" content of a Doc is not
+  a thing that exists.
+- **Shared drives are included.** Every call opts in explicitly; without that
+  the API quietly pretends team-drive content does not exist and a search
+  returns a confident, wrong "no results".
+- **Nothing is deleted permanently.** `trash_drive_file` bins the file, Drive
+  keeps it 30 days, and `restore_drive_file` brings it back.
+
+Sharing is deliberately limited: files can be shared with **named people only**.
+The server cannot create "anyone with the link" access, because a mistakenly
+public file is hard to notice afterwards. It *can* remove such a permission —
+`get_drive_permissions` flags a publicly reachable file and `unshare_drive_file`
+revokes it.
 
 ### Attachments
 
@@ -194,7 +229,11 @@ mailbox has to be reconnected.
 - **Uploaded filenames never touch the filesystem path.** Files are stored under
   a random name; the display name lives only in the database.
 - **`gmail.modify` is requested, not `gmail.full`** — an agent can archive, label
-  and trash, but cannot permanently delete mail.
+  and trash, but cannot permanently delete mail. Drive follows the same line: the
+  server never calls `files.delete`, only trash and restore.
+- **Capabilities are checked before the call.** An account connected before a
+  capability existed is detected from its stored scopes and told to extend its
+  permission, rather than failing with an opaque 403 from inside the API.
 - Anyone holding an API key can read, send and delete mail in every connected
   mailbox. Treat keys as you would the mailbox passwords themselves, and revoke
   them from the dashboard when a client is retired.

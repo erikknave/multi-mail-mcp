@@ -78,4 +78,18 @@ export const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/gmail.modify',
   'https://www.googleapis.com/auth/gmail.send',
   'https://www.googleapis.com/auth/calendar',
+  'https://www.googleapis.com/auth/drive',
 ] as const;
+
+/**
+ * Scopes a given capability needs, so we can tell an account that predates a
+ * capability apart from one whose grant has actually died. Without this the
+ * former shows up as an opaque 403 from deep inside googleapis.
+ */
+export const SCOPE_FOR = {
+  gmail: 'https://www.googleapis.com/auth/gmail.modify',
+  calendar: 'https://www.googleapis.com/auth/calendar',
+  drive: 'https://www.googleapis.com/auth/drive',
+} as const;
+
+export type Capability = keyof typeof SCOPE_FOR;

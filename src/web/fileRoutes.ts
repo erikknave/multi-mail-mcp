@@ -2,9 +2,12 @@ import { createReadStream } from 'node:fs';
 import { Hono } from 'hono';
 import { accounts, uploads, users } from '../db/repo.js';
 import { getAttachment } from '../google/gmail.js';
+import { extensionForExport, getFileBytes, getFileMetadata } from '../google/drive.js';
 import {
+  driveClient,
   gmailClient,
   parseDownloadToken,
+  parseDriveDownloadToken,
   parseUploadToken,
   ServiceError,
   storeUpload,
@@ -96,4 +99,51 @@ fileRoutes.get('/files/upload/:token', async (c) => {
       'cache-control': 'private, no-store',
     },
   });
+});
+
+/**
+ * Streams a Drive file, exporting Google-native formats on the way. Like the
+ * attachment route, nothing is cached: the signed token in the path is the only
+ * thing granting access.
+ */
+fileRoutes.get('/files/drive/:token', async (c) => {
+  const payload = parseDriveDownloadToken(c.req.param('token'));
+  if (!payload) return c.text('This download link has expired or is invalid.', 403);
+
+  const user = users.byId(payload.uid);
+  const account = accounts.byId(payload.aid);
+  if (!user || !account || account.user_id !== user.id) {
+    return c.text('This download link is no longer valid.', 404);
+  }
+
+  try {
+    const drive = await driveClient(account);
+    const meta = await getFileMetadata(drive, payload.fid);
+    const { data, contentType, exported } = await getFileBytes(
+      drive,
+      meta,
+      payload.ex || undefined,
+    );
+
+    // An exported Google Doc arrives as .docx/.csv/…, so the stored name needs
+    // the matching extension or the file lands unopenable on the user's disk.
+    const filename =
+      exported && !payload.fn.includes('.')
+        ? `${payload.fn}${extensionForExport(contentType)}`
+        : payload.fn;
+
+    const asciiName = filename.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, '');
+    return new Response(new Uint8Array(data), {
+      headers: {
+        'content-type': contentType,
+        'content-length': String(data.byteLength),
+        'content-disposition':
+          `attachment; filename="${asciiName}"; ` +
+          `filename*=UTF-8''${encodeURIComponent(filename)}`,
+        'cache-control': 'private, no-store',
+      },
+    });
+  } catch (err) {
+    return c.text(`Could not fetch the file: ${(err as Error).message}`, 502);
+  }
 });

@@ -1,5 +1,5 @@
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { ReauthRequiredError } from '../google/oauth.js';
+import { ReauthRequiredError, ScopeMissingError } from '../google/oauth.js';
 import { ServiceError } from '../service.js';
 
 /** JSON payload as the tool's text content, pretty-printed for readability. */
@@ -79,6 +79,14 @@ export async function guard(fn: () => Promise<CallToolResult>): Promise<CallTool
           `${err.reauthUrl}\n\n` +
           `Once they confirm they are done, retry this tool call. ` +
           `(Underlying reason: ${err.reason})`,
+      );
+    }
+    if (err instanceof ScopeMissingError) {
+      return fail(
+        `ACTION REQUIRED — ${err.accountEmail} has not granted ${err.capability} access.\n\n` +
+          `This mailbox was connected before that capability was added, so its permission ` +
+          `needs extending. Ask the user to open this link and approve:\n${err.reauthUrl}\n\n` +
+          `Once they confirm, retry this tool call. Other accounts are unaffected.`,
       );
     }
     if (err instanceof ServiceError) {

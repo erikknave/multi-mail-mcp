@@ -480,3 +480,125 @@ test('a fully successful result states plainly that it is complete', async () =>
   assert.ok(!('warning' in payload));
   assert.ok(!('accountsWithProblems' in payload));
 });
+
+/* ------------------------------------------------------------------ *
+ * Drive
+ * ------------------------------------------------------------------ */
+
+test('Google-native files are recognised as needing export', async () => {
+  const { toFileSummary, isGoogleNative, isFolder } = await import('./google/drive.js');
+
+  const doc = toFileSummary({ id: 'd1', name: 'Notes', mimeType: 'application/vnd.google-apps.document' });
+  assert.equal(doc.kind, 'google-doc');
+  assert.equal(doc.needsExport, true, 'a Google Doc has no bytes of its own');
+
+  const pdf = toFileSummary({ id: 'f1', name: 'a.pdf', mimeType: 'application/pdf', size: '2048' });
+  assert.equal(pdf.kind, 'file');
+  assert.equal(pdf.needsExport, false);
+  assert.equal(pdf.sizeBytes, 2048);
+
+  // A folder is Google-native but must never be treated as an exportable file.
+  const folder = toFileSummary({ id: 'x1', name: 'Docs', mimeType: 'application/vnd.google-apps.folder' });
+  assert.equal(folder.kind, 'folder');
+  assert.equal(isGoogleNative(folder.mimeType), true);
+  assert.equal(isFolder(folder.mimeType), true);
+  assert.equal(folder.needsExport, false, 'a folder must not be offered for export');
+});
+
+test('each Google-native type has a text and a binary export target', async () => {
+  const { defaultTextExport, defaultBinaryExport, extensionForExport, GOOGLE_DOC, GOOGLE_SHEET, GOOGLE_SLIDES } =
+    await import('./google/drive.js');
+
+  assert.equal(defaultTextExport(GOOGLE_DOC), 'text/markdown');
+  assert.equal(defaultTextExport(GOOGLE_SHEET), 'text/csv');
+  assert.equal(defaultTextExport(GOOGLE_SLIDES), 'text/plain');
+  assert.equal(defaultTextExport('application/pdf'), null, 'ordinary files are not exported');
+
+  assert.match(defaultBinaryExport(GOOGLE_DOC)!, /wordprocessingml/);
+  assert.match(defaultBinaryExport(GOOGLE_SHEET)!, /spreadsheetml/);
+  assert.match(defaultBinaryExport(GOOGLE_SLIDES)!, /presentationml/);
+
+  // The extension matters: an exported Doc saved without one is unopenable.
+  assert.equal(extensionForExport(defaultBinaryExport(GOOGLE_DOC)!), '.docx');
+  assert.equal(extensionForExport(defaultBinaryExport(GOOGLE_SHEET)!), '.xlsx');
+  assert.equal(extensionForExport('text/csv'), '.csv');
+});
+
+test('a shared-drive file is flagged as such', async () => {
+  const { toFileSummary } = await import('./google/drive.js');
+  const shared = toFileSummary({
+    id: 's1', name: 'Team plan', mimeType: 'application/pdf', driveId: 'drv_1', shared: true,
+  });
+  assert.equal(shared.inSharedDrive, true);
+  assert.equal(shared.shared, true);
+});
+
+test('every Drive call opts into shared drives', async () => {
+  // Without supportsAllDrives/includeItemsFromAllDrives the API silently omits
+  // shared-drive content, so a search returns a confident, wrong "no results".
+  const source = await readFile(new URL('./google/drive.ts', import.meta.url), 'utf8');
+  assert.match(source, /supportsAllDrives: true/);
+  assert.match(source, /includeItemsFromAllDrives: true/);
+
+  const listCalls = source.match(/drive\.files\.list\(\{[\s\S]*?\}\);/g) ?? [];
+  assert.ok(listCalls.length >= 2, 'expected search and folder listing');
+  for (const call of listCalls) {
+    assert.match(call, /ALL_DRIVES/, `a files.list call omits shared drives:\n${call}`);
+  }
+});
+
+test('the server can never create public link sharing', async () => {
+  const source = await readFile(new URL('./google/drive.ts', import.meta.url), 'utf8');
+  const createCall = /drive\.permissions\.create\(\{[\s\S]*?\}\);/.exec(source);
+  assert.ok(createCall, 'permission creation must exist');
+  assert.match(createCall[0], /type: 'user'/, 'permissions must be granted to named users only');
+  assert.doesNotMatch(
+    createCall[0],
+    /type: 'anyone'|type: 'domain'/,
+    'this server must not be able to make a file publicly or domain-wide accessible',
+  );
+});
+
+test('deletion is always reversible', async () => {
+  const source = await readFile(new URL('./google/drive.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(
+    source,
+    /drive\.files\.delete\(/,
+    'files.delete is permanent; this server must only ever trash',
+  );
+  assert.match(source, /trashed: true/, 'trashing must be implemented');
+  assert.match(source, /trashed: false/, 'restoring must be implemented');
+});
+
+/* ------------------------------------------------------------------ *
+ * Capability / scope drift
+ * ------------------------------------------------------------------ */
+
+test('an account is only granted a capability its stored scopes cover', async () => {
+  const { hasCapability } = await import('./google/oauth.js');
+  const base = {
+    id: 'a', user_id: 'u', email: 'x@y.com', google_sub: null, display_name: null,
+    refresh_token_enc: null, access_token_enc: null, access_token_expires: null,
+    status: 'active' as const, last_error: null, last_ok_at: null, created_at: 0, updated_at: 0,
+  };
+
+  const old = { ...base, scopes: 'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar' };
+  assert.equal(hasCapability(old, 'gmail'), true);
+  assert.equal(hasCapability(old, 'calendar'), true);
+  assert.equal(hasCapability(old, 'drive'), false, 'an account predating Drive must not claim it');
+
+  const current = { ...base, scopes: `${old.scopes} https://www.googleapis.com/auth/drive` };
+  assert.equal(hasCapability(current, 'drive'), true);
+
+  // A partial match must not count: drive.file is not drive.
+  const narrow = { ...base, scopes: 'https://www.googleapis.com/auth/drive.file' };
+  assert.equal(hasCapability(narrow, 'drive'), false, 'drive.file must not satisfy full drive');
+});
+
+test('Drive is part of the requested scope set', async () => {
+  const { GOOGLE_SCOPES, SCOPE_FOR } = await import('./config.js');
+  assert.ok(
+    (GOOGLE_SCOPES as readonly string[]).includes(SCOPE_FOR.drive),
+    'consent must request the Drive scope, or no account can ever grant it',
+  );
+});
