@@ -754,3 +754,141 @@ test('a disabled Google API is reported as a project setting, not a permission p
   assert.equal(apiDisabledMessage('Some other failure'), null, 'unrelated errors pass through');
   assert.equal(apiDisabledMessage(new Error('invalid_grant')), null);
 });
+
+/* ------------------------------------------------------------------ *
+ * Calendar attendees and rooms
+ * ------------------------------------------------------------------ */
+
+test('a room is distinguishable from a person', async () => {
+  const { toEventSummary } = await import('./google/calendar.js');
+  const e = toEventSummary({
+    id: 'e1',
+    summary: 'Retro',
+    start: { dateTime: '2026-08-12T13:00:00Z' },
+    end: { dateTime: '2026-08-12T14:00:00Z' },
+    organizer: { email: 'rikard@example.com' },
+    attendees: [
+      { email: 'rikard@example.com', displayName: 'Rikard', responseStatus: 'accepted', organizer: true },
+      { email: 'erik@example.com', responseStatus: 'needsAction', self: true },
+      {
+        email: 'c_188@resource.calendar.google.com',
+        displayName: 'FS-3-Reef (12) [TV]',
+        responseStatus: 'accepted',
+        resource: true,
+      },
+    ],
+  });
+
+  // Without these an agent cannot tell the opaque resource address from a person.
+  const room = e.attendees.find((a) => a.isResource);
+  assert.ok(room, 'the room must be flagged as a resource');
+  assert.equal(room.displayName, 'FS-3-Reef (12) [TV]', 'the room must be nameable');
+  assert.deepEqual(e.rooms.map((r) => r.email), ['c_188@resource.calendar.google.com']);
+  assert.equal(e.attendees.filter((a) => !a.isResource).length, 2, 'people and rooms are separable');
+  assert.equal(e.isOrganizer, false, 'organiser.self drives isOrganizer');
+});
+
+test('a recurring occurrence reports the series it belongs to', async () => {
+  const { toEventSummary } = await import('./google/calendar.js');
+  const instance = toEventSummary({
+    id: 'abc_20260812T130000Z',
+    recurringEventId: 'abc_R20260320T140000',
+    start: { dateTime: '2026-08-12T13:00:00Z' },
+    end: { dateTime: '2026-08-12T14:00:00Z' },
+  });
+  assert.equal(instance.isRecurringInstance, true);
+  assert.equal(instance.recurringEventId, 'abc_R20260320T140000');
+
+  const oneOff = toEventSummary({ id: 'x', start: { date: '2026-08-12' }, end: { date: '2026-08-13' } });
+  assert.equal(oneOff.isRecurringInstance, false);
+  assert.equal(oneOff.recurringEventId, null);
+});
+
+test('attendee changes merge instead of rewriting the guest list', async () => {
+  // The regression this guards: sending `{email}` objects for everyone drops the
+  // booked room and resets every RSVP. Existing attendee objects must survive.
+  const source = await readFile(new URL('./google/calendar.ts', import.meta.url), 'utf8');
+  const fn = /export async function changeAttendees[\s\S]*?\n}/.exec(source);
+  assert.ok(fn, 'changeAttendees must exist');
+  assert.match(fn[0], /events\.get\(/, 'it must read the current attendees before patching');
+  assert.match(fn[0], /const kept = existing\.find/, 'surviving attendees must be carried over whole');
+  assert.match(fn[0], /toLowerCase/, 'address matching must be case-insensitive');
+});
+
+test('changeAttendees preserves a room and RSVPs when adding one person', async () => {
+  const { changeAttendees } = await import('./google/calendar.js');
+
+  const existing = [
+    { email: 'rikard@example.com', responseStatus: 'accepted', organizer: true },
+    { email: 'c_188@resource.calendar.google.com', displayName: 'FS-3-Reef', responseStatus: 'accepted', resource: true },
+  ];
+  let sent: unknown;
+
+  const fakeCal = {
+    events: {
+      get: async () => ({ data: { attendees: existing } }),
+      patch: async (req: { requestBody: { attendees: unknown } }) => {
+        sent = req.requestBody.attendees;
+        return { data: { id: 'e1', attendees: req.requestBody.attendees } };
+      },
+    },
+  } as never;
+
+  const result = await changeAttendees(fakeCal, 'primary', 'e1', { add: ['Anna@Example.com'] }, 'all');
+
+  const out = sent as Array<Record<string, unknown>>;
+  assert.equal(out.length, 3, 'the new person is added to the existing two');
+  assert.deepEqual(out[0], existing[0], 'the accepted RSVP is untouched');
+  assert.deepEqual(out[1], existing[1], 'the room keeps its resource flag and booking');
+  assert.deepEqual(out[2], { email: 'anna@example.com' }, 'the new address is normalised');
+  assert.deepEqual(result.added, ['anna@example.com']);
+  assert.deepEqual(result.removed, []);
+  assert.equal(result.unchanged, 2);
+});
+
+test('changeAttendees will not add someone twice', async () => {
+  const { changeAttendees } = await import('./google/calendar.js');
+  let sent: Array<Record<string, unknown>> = [];
+  const fakeCal = {
+    events: {
+      get: async () => ({ data: { attendees: [{ email: 'anna@example.com', responseStatus: 'accepted' }] } }),
+      patch: async (req: { requestBody: { attendees: Array<Record<string, unknown>> } }) => {
+        sent = req.requestBody.attendees;
+        return { data: { id: 'e1' } };
+      },
+    },
+  } as never;
+
+  const result = await changeAttendees(fakeCal, 'primary', 'e1', { add: ['ANNA@example.com'] }, 'none');
+  assert.equal(sent.length, 1, 'a differently-cased duplicate must not be added again');
+  assert.deepEqual(result.added, []);
+  assert.equal(sent[0]!.responseStatus, 'accepted', 'and their RSVP survives');
+});
+
+test('replacing the guest list still preserves survivors', async () => {
+  const { changeAttendees } = await import('./google/calendar.js');
+  let sent: Array<Record<string, unknown>> = [];
+  const existing = [
+    { email: 'anna@example.com', responseStatus: 'accepted' },
+    { email: 'bo@example.com', responseStatus: 'declined' },
+  ];
+  const fakeCal = {
+    events: {
+      get: async () => ({ data: { attendees: existing } }),
+      patch: async (req: { requestBody: { attendees: Array<Record<string, unknown>> } }) => {
+        sent = req.requestBody.attendees;
+        return { data: { id: 'e1' } };
+      },
+    },
+  } as never;
+
+  const result = await changeAttendees(
+    fakeCal, 'primary', 'e1', { replace: ['anna@example.com', 'cecilia@example.com'] }, 'all',
+  );
+
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0]!.responseStatus, 'accepted', 'a retained guest keeps their RSVP');
+  assert.deepEqual(sent[1], { email: 'cecilia@example.com' });
+  assert.deepEqual(result.removed, ['bo@example.com']);
+  assert.deepEqual(result.added, ['cecilia@example.com']);
+});

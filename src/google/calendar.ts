@@ -14,6 +14,22 @@ export interface CalendarSummary {
   accessRole: string;
 }
 
+export interface AttendeeInfo {
+  email: string;
+  /** Human name, and for a room the booking name such as "FS-3-Reef (12)". */
+  displayName: string | null;
+  responseStatus: string;
+  optional: boolean;
+  /**
+   * True for a meeting room or other bookable resource. Without this an agent
+   * cannot tell a room's opaque resource address from a person's, and will
+   * happily drop the room when rewriting the attendee list.
+   */
+  isResource: boolean;
+  isOrganizer: boolean;
+  isSelf: boolean;
+}
+
 export interface EventSummary {
   id: string;
   status: string;
@@ -25,12 +41,20 @@ export interface EventSummary {
   end: string | null;
   allDay: boolean;
   organizer: string | null;
-  attendees: Array<{ email: string; responseStatus: string; optional: boolean }>;
+  attendees: AttendeeInfo[];
+  /** The resource attendees, split out because "which room is booked" is a question worth answering directly. */
+  rooms: AttendeeInfo[];
   hangoutLink: string | null;
   htmlLink: string | null;
   recurrence: string[] | null;
   /** Your own response on this event, when you are an attendee. */
   selfResponseStatus: string | null;
+  /** Whether you organise this event. Non-organisers can often still edit — see canEdit. */
+  isOrganizer: boolean;
+  guestsCanModify: boolean;
+  /** Set when this is one occurrence of a repeating event; the id of the series. */
+  recurringEventId: string | null;
+  isRecurringInstance: boolean;
 }
 
 function whenOf(d: calendar_v3.Schema$EventDateTime | undefined): {
@@ -46,10 +70,14 @@ function whenOf(d: calendar_v3.Schema$EventDateTime | undefined): {
 export function toEventSummary(e: calendar_v3.Schema$Event): EventSummary {
   const start = whenOf(e.start);
   const end = whenOf(e.end);
-  const attendees = (e.attendees ?? []).map((a) => ({
+  const attendees: AttendeeInfo[] = (e.attendees ?? []).map((a) => ({
     email: a.email ?? '',
+    displayName: a.displayName ?? null,
     responseStatus: a.responseStatus ?? 'needsAction',
     optional: a.optional ?? false,
+    isResource: a.resource ?? false,
+    isOrganizer: a.organizer ?? false,
+    isSelf: a.self ?? false,
   }));
   const self = (e.attendees ?? []).find((a) => a.self);
 
@@ -64,10 +92,15 @@ export function toEventSummary(e: calendar_v3.Schema$Event): EventSummary {
     allDay: start.allDay,
     organizer: e.organizer?.email ?? null,
     attendees,
+    rooms: attendees.filter((a) => a.isResource),
     hangoutLink: e.hangoutLink ?? null,
     htmlLink: e.htmlLink ?? null,
     recurrence: e.recurrence ?? null,
     selfResponseStatus: self?.responseStatus ?? null,
+    isOrganizer: e.organizer?.self ?? false,
+    guestsCanModify: e.guestsCanModify ?? false,
+    recurringEventId: e.recurringEventId ?? null,
+    isRecurringInstance: !!e.recurringEventId,
   };
 }
 
@@ -173,6 +206,129 @@ export async function createEvent(
     requestBody: toRequestBody(input),
   });
   return toEventSummary(res.data);
+}
+
+export interface AttendeeChange {
+  /** Addresses to add. A room is added by its resource address, like anyone else. */
+  add?: string[];
+  /** Addresses to remove. */
+  remove?: string[];
+  /** Replace the entire list. Mutually exclusive with add/remove. */
+  replace?: string[];
+}
+
+/**
+ * Applies attendee changes by merging against the event's current list.
+ *
+ * The Calendar API only accepts a whole attendee array, so a naive "change the
+ * attendees" rewrites everyone as `{email}` — which silently drops the booked
+ * room, discards every RSVP, and re-invites people who had already accepted.
+ * Merging keeps each existing attendee object untouched, so only the people you
+ * named actually change.
+ */
+export async function changeAttendees(
+  cal: calendar_v3.Calendar,
+  calendarId: string,
+  eventId: string,
+  change: AttendeeChange,
+  sendUpdates: 'all' | 'externalOnly' | 'none',
+): Promise<{ event: EventSummary; added: string[]; removed: string[]; unchanged: number }> {
+  const current = await cal.events.get({ calendarId, eventId });
+  const existing = current.data.attendees ?? [];
+
+  const norm = (e: string) => e.trim().toLowerCase();
+  let next: calendar_v3.Schema$EventAttendee[];
+  const added: string[] = [];
+  const removed: string[] = [];
+
+  if (change.replace) {
+    const wanted = change.replace.map(norm);
+    // Carry over the full object for anyone who survives the replacement, so
+    // their response status and resource flag are preserved.
+    next = wanted.map((email) => {
+      const kept = existing.find((a) => norm(a.email ?? '') === email);
+      if (kept) return kept;
+      added.push(email);
+      return { email };
+    });
+    for (const a of existing) {
+      if (!wanted.includes(norm(a.email ?? ''))) removed.push(a.email ?? '');
+    }
+  } else {
+    const toRemove = new Set((change.remove ?? []).map(norm));
+    next = existing.filter((a) => {
+      const drop = toRemove.has(norm(a.email ?? ''));
+      if (drop) removed.push(a.email ?? '');
+      return !drop;
+    });
+    for (const email of change.add ?? []) {
+      const normalized = norm(email);
+      if (next.some((a) => norm(a.email ?? '') === normalized)) continue;
+      next.push({ email: normalized });
+      added.push(normalized);
+    }
+  }
+
+  const res = await cal.events.patch({
+    calendarId,
+    eventId,
+    sendUpdates,
+    requestBody: { attendees: next },
+  });
+
+  return {
+    event: toEventSummary(res.data),
+    added,
+    removed,
+    unchanged: next.length - added.length,
+  };
+}
+
+/**
+ * Meeting rooms seen in the user's own calendar history.
+ *
+ * Listing an organisation's rooms properly needs the Admin SDK and admin
+ * rights, which an ordinary user does not have. Rooms the person has actually
+ * booked before are both obtainable without any extra permission and, in
+ * practice, the ones they want again.
+ */
+export async function findRoomsInHistory(
+  cal: calendar_v3.Calendar,
+  daysBack: number,
+  daysForward: number,
+): Promise<Array<{ email: string; name: string; timesSeen: number; lastSeen: string | null }>> {
+  const res = await cal.events.list({
+    calendarId: 'primary',
+    timeMin: new Date(Date.now() - daysBack * 86400000).toISOString(),
+    timeMax: new Date(Date.now() + daysForward * 86400000).toISOString(),
+    singleEvents: true,
+    orderBy: 'startTime',
+    maxResults: 2500,
+  });
+
+  const rooms = new Map<string, { email: string; name: string; timesSeen: number; lastSeen: string | null }>();
+
+  for (const event of res.data.items ?? []) {
+    const when = event.start?.dateTime ?? event.start?.date ?? null;
+    for (const a of event.attendees ?? []) {
+      if (!a.resource || !a.email) continue;
+      const found = rooms.get(a.email);
+      if (found) {
+        found.timesSeen++;
+        if (when && (!found.lastSeen || when > found.lastSeen)) found.lastSeen = when;
+        if (a.displayName && found.name === a.email) found.name = a.displayName;
+      } else {
+        rooms.set(a.email, {
+          email: a.email,
+          name: a.displayName ?? a.email,
+          timesSeen: 1,
+          lastSeen: when,
+        });
+      }
+    }
+  }
+
+  return [...rooms.values()].sort((a, b) => b.timesSeen - a.timesSeen);
 }
 
 export async function updateEvent(

@@ -111,7 +111,8 @@ past 100 users.
 `modify_labels`, `send_message`, `create_draft`, `get_attachment_url`
 
 **Calendar** — `list_calendars`, `list_events`, `get_event`, `create_event`,
-`update_event`, `delete_event`, `respond_to_event`, `find_free_time`
+`update_event`, `delete_event`, `respond_to_event`, `find_free_time`,
+`find_rooms`
 
 **Drive** — `search_drive`, `read_drive_file`, `list_drive_folder`,
 `get_drive_download_url`, `upload_to_drive`, `write_drive_file`,
@@ -171,6 +172,32 @@ The server cannot create "anyone with the link" access, because a mistakenly
 public file is hard to notice afterwards. It *can* remove such a permission —
 `get_drive_permissions` flags a publicly reachable file and `unshare_drive_file`
 revokes it.
+
+### Changing an existing invitation
+
+A meeting room is an **attendee**, not the `location` field — it is booked by
+adding its resource address, and `location` is free text that books nothing.
+Events report their rooms separately (`rooms`) and flag each attendee with
+`isResource` and a `displayName`, so a room is never just an opaque
+`c_188…@resource.calendar.google.com`.
+
+`update_event` merges guest changes rather than replacing them:
+
+- `addAttendees` / `removeAttendees` change only the people you name. Everyone
+  else keeps their RSVP, and any booked room stays booked.
+- `setAttendees` replaces the whole list, uninviting anyone omitted — including
+  rooms. It exists for when that is genuinely the intent.
+
+The response says what actually changed, including when a room booking was
+released or taken.
+
+`find_rooms` lists the rooms you have used before, most frequent first, with the
+address needed to book one. Enumerating every room in an organisation needs
+Workspace admin rights, which this server does not have — but the rooms you have
+already met in are the ones you want again.
+
+For a repeating event, changes apply to the single occurrence unless you pass
+`applyTo: "series"`.
 
 ### Sheets and Docs
 
