@@ -153,8 +153,11 @@ export async function getSpreadsheet(
   const res = await sheets.spreadsheets.get({
     spreadsheetId,
     fields:
-      'spreadsheetId, spreadsheetUrl, properties(title,locale,timeZone), ' +
-      'sheets.properties(sheetId,title,index,hidden,gridProperties)',
+      'spreadsheetId,spreadsheetUrl,properties(title,locale,timeZone),' +
+      // Sub-selection must nest as sheets(properties(...)); writing
+      // sheets.properties(...) mixes dot notation with parentheses and Google
+      // rejects the whole request as an invalid argument.
+      'sheets(properties(sheetId,title,index,hidden,gridProperties))',
   });
 
   return {
@@ -581,8 +584,11 @@ export async function createSpreadsheet(
         : {}),
     },
     fields:
-      'spreadsheetId, spreadsheetUrl, properties(title,locale,timeZone), ' +
-      'sheets.properties(sheetId,title,index,hidden,gridProperties)',
+      'spreadsheetId,spreadsheetUrl,properties(title,locale,timeZone),' +
+      // Sub-selection must nest as sheets(properties(...)); writing
+      // sheets.properties(...) mixes dot notation with parentheses and Google
+      // rejects the whole request as an invalid argument.
+      'sheets(properties(sheetId,title,index,hidden,gridProperties))',
   });
 
   return {

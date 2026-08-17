@@ -892,3 +892,52 @@ test('replacing the guest list still preserves survivors', async () => {
   assert.deepEqual(result.removed, ['bo@example.com']);
   assert.deepEqual(result.added, ['cecilia@example.com']);
 });
+
+/* ------------------------------------------------------------------ *
+ * Google API field masks
+ * ------------------------------------------------------------------ */
+
+test('no field mask mixes dot notation with sub-selection parentheses', async () => {
+  // "sheets.properties(sheetId,title)" is rejected by Google as an invalid
+  // argument — sub-selection must nest, as "sheets(properties(sheetId,title))".
+  // The request fails wholesale, so one bad mask takes out an entire tool while
+  // its neighbours keep working, which makes it look like a permissions problem.
+  const files = ['./google/sheets.ts', './google/drive.ts', './google/docs.ts', './google/calendar.ts'];
+  const offenders: string[] = [];
+
+  for (const file of files) {
+    const source = await readFile(new URL(file, import.meta.url), 'utf8');
+
+    // Collect the string literals belonging to a `fields:` assignment, which may
+    // continue over several concatenated lines.
+    const lines = source.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (!/\bfields:/.test(lines[i]!)) continue;
+
+      let mask = '';
+      for (let j = i; j < Math.min(i + 6, lines.length); j++) {
+        const line = lines[j]!;
+        if (line.trimStart().startsWith('//')) continue;
+        for (const m of line.matchAll(/'([^']*)'/g)) mask += m[1];
+        if (/[,)]\s*$/.test(line.trim()) && j > i) break;
+        if (j > i && !/\+\s*$/.test(line.trim())) break;
+      }
+
+      if (/[A-Za-z][A-Za-z0-9]*\.[A-Za-z][A-Za-z0-9]*\(/.test(mask)) {
+        offenders.push(`${file}: ${mask}`);
+      }
+    }
+  }
+
+  assert.deepEqual(offenders, [], `invalid field mask(s):\n${offenders.join('\n')}`);
+});
+
+test('the spreadsheet mask nests its sub-selection', async () => {
+  const source = await readFile(new URL('./google/sheets.ts', import.meta.url), 'utf8');
+  assert.match(source, /sheets\(properties\(/, 'sub-selection must nest');
+  assert.doesNotMatch(
+    source,
+    /'sheets\.properties\(/,
+    'sheets.properties(...) is the invalid form that broke list_sheet_tabs',
+  );
+});
