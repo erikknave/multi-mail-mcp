@@ -45,7 +45,10 @@ const server = serve({ fetch: app.fetch, port: config.port, hostname: '0.0.0.0' 
   console.log(`multi-mail-mcp listening on http://localhost:${info.port}`);
   console.log(`  public base URL : ${config.publicBaseUrl}`);
   console.log(`  MCP endpoint    : ${config.publicBaseUrl}/mcp`);
-  console.log(`  OAuth redirect  : ${config.google.redirectUri}`);
+  console.log(`  Google redirect : ${config.google.redirectUri}`);
+  console.log(
+    `  MS redirect     : ${config.microsoft?.redirectUri ?? '(Microsoft accounts not configured)'}`,
+  );
   console.log(`  users registered: ${users.count()}`);
   if (users.count() === 0) {
     console.log(`\n  Open ${config.publicBaseUrl}/ and sign in with Google to get started.`);

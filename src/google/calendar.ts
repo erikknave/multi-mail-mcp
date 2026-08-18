@@ -1,60 +1,29 @@
 import { google, type calendar_v3 } from 'googleapis';
 import type { OAuth2Client } from 'google-auth-library';
+import type {
+  AttendeeChange,
+  AttendeeInfo,
+  CalendarApi,
+  CalendarSummary,
+  EventInput,
+  EventSummary,
+  FreeBusySlot,
+  ListEventsParams,
+  RoomUsage,
+  SendUpdates,
+} from '../calendar/types.js';
+
+export type {
+  AttendeeChange,
+  AttendeeInfo,
+  CalendarSummary,
+  EventInput,
+  EventSummary,
+  FreeBusySlot,
+};
 
 export function calendarFor(auth: OAuth2Client): calendar_v3.Calendar {
   return google.calendar({ version: 'v3', auth });
-}
-
-export interface CalendarSummary {
-  id: string;
-  summary: string;
-  description: string | null;
-  timeZone: string | null;
-  primary: boolean;
-  accessRole: string;
-}
-
-export interface AttendeeInfo {
-  email: string;
-  /** Human name, and for a room the booking name such as "FS-3-Reef (12)". */
-  displayName: string | null;
-  responseStatus: string;
-  optional: boolean;
-  /**
-   * True for a meeting room or other bookable resource. Without this an agent
-   * cannot tell a room's opaque resource address from a person's, and will
-   * happily drop the room when rewriting the attendee list.
-   */
-  isResource: boolean;
-  isOrganizer: boolean;
-  isSelf: boolean;
-}
-
-export interface EventSummary {
-  id: string;
-  status: string;
-  summary: string;
-  description: string | null;
-  location: string | null;
-  /** ISO 8601 with offset for timed events, or YYYY-MM-DD for all-day events. */
-  start: string | null;
-  end: string | null;
-  allDay: boolean;
-  organizer: string | null;
-  attendees: AttendeeInfo[];
-  /** The resource attendees, split out because "which room is booked" is a question worth answering directly. */
-  rooms: AttendeeInfo[];
-  hangoutLink: string | null;
-  htmlLink: string | null;
-  recurrence: string[] | null;
-  /** Your own response on this event, when you are an attendee. */
-  selfResponseStatus: string | null;
-  /** Whether you organise this event. Non-organisers can often still edit — see canEdit. */
-  isOrganizer: boolean;
-  guestsCanModify: boolean;
-  /** Set when this is one occurrence of a repeating event; the id of the series. */
-  recurringEventId: string | null;
-  isRecurringInstance: boolean;
 }
 
 function whenOf(d: calendar_v3.Schema$EventDateTime | undefined): {
@@ -118,13 +87,7 @@ export async function listCalendars(cal: calendar_v3.Calendar): Promise<Calendar
 
 export async function listEvents(
   cal: calendar_v3.Calendar,
-  params: {
-    calendarId: string;
-    timeMin?: string;
-    timeMax?: string;
-    query?: string;
-    maxResults: number;
-  },
+  params: ListEventsParams,
 ): Promise<EventSummary[]> {
   const res = await cal.events.list({
     calendarId: params.calendarId,
@@ -147,19 +110,6 @@ export async function getEvent(
 ): Promise<EventSummary> {
   const res = await cal.events.get({ calendarId, eventId });
   return toEventSummary(res.data);
-}
-
-export interface EventInput {
-  summary: string;
-  description?: string;
-  location?: string;
-  /** ISO 8601 datetime, or YYYY-MM-DD for an all-day event. */
-  start: string;
-  end: string;
-  timeZone?: string;
-  attendees?: string[];
-  addConference?: boolean;
-  recurrence?: string[];
 }
 
 function toEventDateTime(
@@ -197,7 +147,7 @@ export async function createEvent(
   cal: calendar_v3.Calendar,
   calendarId: string,
   input: EventInput,
-  sendUpdates: 'all' | 'externalOnly' | 'none',
+  sendUpdates: SendUpdates,
 ): Promise<EventSummary> {
   const res = await cal.events.insert({
     calendarId,
@@ -206,15 +156,6 @@ export async function createEvent(
     requestBody: toRequestBody(input),
   });
   return toEventSummary(res.data);
-}
-
-export interface AttendeeChange {
-  /** Addresses to add. A room is added by its resource address, like anyone else. */
-  add?: string[];
-  /** Addresses to remove. */
-  remove?: string[];
-  /** Replace the entire list. Mutually exclusive with add/remove. */
-  replace?: string[];
 }
 
 /**
@@ -231,7 +172,7 @@ export async function changeAttendees(
   calendarId: string,
   eventId: string,
   change: AttendeeChange,
-  sendUpdates: 'all' | 'externalOnly' | 'none',
+  sendUpdates: SendUpdates,
 ): Promise<{ event: EventSummary; added: string[]; removed: string[]; unchanged: number }> {
   const current = await cal.events.get({ calendarId, eventId });
   const existing = current.data.attendees ?? [];
@@ -296,7 +237,7 @@ export async function findRoomsInHistory(
   cal: calendar_v3.Calendar,
   daysBack: number,
   daysForward: number,
-): Promise<Array<{ email: string; name: string; timesSeen: number; lastSeen: string | null }>> {
+): Promise<RoomUsage[]> {
   const res = await cal.events.list({
     calendarId: 'primary',
     timeMin: new Date(Date.now() - daysBack * 86400000).toISOString(),
@@ -306,7 +247,7 @@ export async function findRoomsInHistory(
     maxResults: 2500,
   });
 
-  const rooms = new Map<string, { email: string; name: string; timesSeen: number; lastSeen: string | null }>();
+  const rooms = new Map<string, RoomUsage>();
 
   for (const event of res.data.items ?? []) {
     const when = event.start?.dateTime ?? event.start?.date ?? null;
@@ -336,7 +277,7 @@ export async function updateEvent(
   calendarId: string,
   eventId: string,
   input: Partial<EventInput>,
-  sendUpdates: 'all' | 'externalOnly' | 'none',
+  sendUpdates: SendUpdates,
 ): Promise<EventSummary> {
   // patch, not update: callers should be able to change only the fields they name.
   const body: calendar_v3.Schema$Event = {};
@@ -356,7 +297,7 @@ export async function deleteEvent(
   cal: calendar_v3.Calendar,
   calendarId: string,
   eventId: string,
-  sendUpdates: 'all' | 'externalOnly' | 'none',
+  sendUpdates: SendUpdates,
 ): Promise<void> {
   await cal.events.delete({ calendarId, eventId, sendUpdates });
 }
@@ -391,11 +332,6 @@ export async function respondToEvent(
   return toEventSummary(res.data);
 }
 
-export interface FreeBusySlot {
-  start: string;
-  end: string;
-}
-
 export async function freeBusy(
   cal: calendar_v3.Calendar,
   calendarIds: string[],
@@ -414,4 +350,32 @@ export async function freeBusy(
     out[id] = (value.busy ?? []).map((b) => ({ start: b.start ?? '', end: b.end ?? '' }));
   }
   return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * Provider adapter
+ * ------------------------------------------------------------------ */
+
+/** Presents a Google Calendar client through the provider-neutral interface. */
+export function googleCalendarApi(cal: calendar_v3.Calendar, accountEmail: string): CalendarApi {
+  return {
+    provider: 'google',
+    accountEmail,
+    listCalendars: () => listCalendars(cal),
+    listEvents: (params) => listEvents(cal, params),
+    getEvent: (calendarId, eventId) => getEvent(cal, calendarId, eventId),
+    createEvent: (calendarId, input, sendUpdates) =>
+      createEvent(cal, calendarId, input, sendUpdates),
+    updateEvent: (calendarId, eventId, input, sendUpdates) =>
+      updateEvent(cal, calendarId, eventId, input, sendUpdates),
+    deleteEvent: (calendarId, eventId, sendUpdates) =>
+      deleteEvent(cal, calendarId, eventId, sendUpdates),
+    respondToEvent: (calendarId, eventId, response, comment) =>
+      respondToEvent(cal, calendarId, eventId, response, comment),
+    changeAttendees: (calendarId, eventId, change, sendUpdates) =>
+      changeAttendees(cal, calendarId, eventId, change, sendUpdates),
+    freeBusy: (calendarIds, timeMin, timeMax) => freeBusy(cal, calendarIds, timeMin, timeMax),
+    findRoomsInHistory: (daysBack, daysForward) =>
+      findRoomsInHistory(cal, daysBack, daysForward),
+  };
 }

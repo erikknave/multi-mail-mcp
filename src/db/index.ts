@@ -20,6 +20,31 @@ db.pragma('busy_timeout = 5000');
 const schema = readFileSync(join(here, 'schema.sql'), 'utf8');
 db.exec(schema);
 
+/**
+ * Schema changes for databases created before a column existed.
+ *
+ * schema.sql only ever runs as CREATE TABLE IF NOT EXISTS, so it does nothing
+ * for an existing database. Each step here is guarded by an inspection of the
+ * live table, which makes running them on every start harmless.
+ */
+function migrate(): void {
+  const columns = new Set(
+    (db.prepare('PRAGMA table_info(accounts)').all() as Array<{ name: string }>).map((c) => c.name),
+  );
+
+  // Multi-provider support: `google_sub` became `provider_sub` when Microsoft
+  // mailboxes arrived, since the column now holds whichever id the provider
+  // issues. Existing rows are all Google, which is what the default records.
+  if (columns.has('google_sub') && !columns.has('provider_sub')) {
+    db.exec('ALTER TABLE accounts RENAME COLUMN google_sub TO provider_sub');
+  }
+  if (!columns.has('provider')) {
+    db.exec("ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'google'");
+  }
+}
+
+migrate();
+
 export function now(): number {
   return Math.floor(Date.now() / 1000);
 }

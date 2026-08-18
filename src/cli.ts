@@ -12,7 +12,7 @@
 import { config } from './config.js';
 import { generateApiKey } from './crypto.js';
 import { accounts, allowedLogins, apiKeys, audit, recentAudit, users } from './db/repo.js';
-import { buildReauthUrl } from './google/oauth.js';
+import { buildReauthUrl } from './oauth/links.js';
 
 function die(message: string): never {
   console.error(message);
@@ -60,7 +60,10 @@ switch (command) {
     const all = accounts.forUser(user.id);
     if (all.length === 0) console.log('(no mailboxes connected)');
     for (const a of all) {
-      console.log(`${a.email.padEnd(32)} ${a.status.padEnd(13)} last ok ${fmtTime(a.last_ok_at)}`);
+      console.log(
+        `${a.email.padEnd(32)} ${a.provider.padEnd(10)} ${a.status.padEnd(13)} ` +
+          `last ok ${fmtTime(a.last_ok_at)}`,
+      );
       if (a.last_error) console.log(`  error: ${a.last_error}`);
       if (a.status === 'needs_reauth') console.log(`  renew: ${buildReauthUrl(a)}`);
     }

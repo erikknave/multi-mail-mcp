@@ -1,20 +1,8 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { User } from '../../db/repo.js';
-import {
-  changeAttendees,
-  createEvent,
-  deleteEvent,
-  findRoomsInHistory,
-  freeBusy,
-  getEvent,
-  listCalendars,
-  listEvents,
-  respondToEvent,
-  updateEvent,
-} from '../../google/calendar.js';
-import { ReauthRequiredError } from '../../google/oauth.js';
-import { calendarClient, resolveAccount, resolveAccounts, ServiceError } from '../../service.js';
+import { ReauthRequiredError } from '../../oauth/errors.js';
+import { calendarApi, resolveAccount, resolveAccounts, ServiceError } from '../../service.js';
 import { guard, ok, partial, type AccountProblem } from '../reply.js';
 
 const accountArg = z
@@ -30,7 +18,23 @@ const calendarIdArg = z
 const sendUpdatesArg = z
   .enum(['all', 'externalOnly', 'none'])
   .default('all')
-  .describe('Whether to email attendees about this change.');
+  .describe(
+    'Whether to email attendees about this change. Google honours all three values; ' +
+      'Outlook always notifies, and says so in the response when a narrower value was asked for.',
+  );
+
+/**
+ * Outlook has no equivalent of Google's sendUpdates, so a caller asking for
+ * silence gets told plainly that the invitations went out anyway. Saying
+ * nothing would let an agent promise a quiet change it did not make.
+ */
+function sendUpdatesNote(provider: string, sendUpdates: string): string[] {
+  if (provider !== 'microsoft' || sendUpdates === 'all') return [];
+  return [
+    'Outlook cannot suppress attendee notifications, so invitations or updates were sent ' +
+      `despite sendUpdates:"${sendUpdates}".`,
+  ];
+}
 
 export function registerCalendarTools(server: McpServer, user: User): void {
   server.registerTool(
@@ -54,8 +58,8 @@ export function registerCalendarTools(server: McpServer, user: User): void {
         const results = await Promise.all(
           targets.map(async (acc) => {
             try {
-              const cal = await calendarClient(acc);
-              return { account: acc.email, calendars: await listCalendars(cal) };
+              const cal = await calendarApi(acc);
+              return { account: acc.email, calendars: await cal.listCalendars() };
             } catch (err) {
               if (err instanceof ReauthRequiredError) {
                 return {
@@ -111,8 +115,8 @@ export function registerCalendarTools(server: McpServer, user: User): void {
         const perAccount = await Promise.all(
           targets.map(async (acc) => {
             try {
-              const cal = await calendarClient(acc);
-              const events = await listEvents(cal, {
+              const cal = await calendarApi(acc);
+              const events = await cal.listEvents({
                 calendarId,
                 timeMin,
                 timeMax,
@@ -182,8 +186,12 @@ export function registerCalendarTools(server: McpServer, user: User): void {
     async ({ eventId, calendarId, account }) =>
       guard(async () => {
         const acc = resolveAccount(user, account);
-        const cal = await calendarClient(acc);
-        return ok({ account: acc.email, calendarId, event: await getEvent(cal, calendarId, eventId) });
+        const cal = await calendarApi(acc);
+        return ok({
+          account: acc.email,
+          calendarId,
+          event: await cal.getEvent(calendarId, eventId),
+        });
       }),
   );
 
@@ -193,7 +201,10 @@ export function registerCalendarTools(server: McpServer, user: User): void {
       title: 'Create a calendar event',
       description:
         'Creates an event. Use ISO 8601 datetimes for timed events, or YYYY-MM-DD for all-day ' +
-        'events. Adding attendees emails them an invitation unless sendUpdates is "none".',
+        'events. Adding attendees emails them an invitation unless sendUpdates is "none".\n\n' +
+        'Recurrence takes RRULE strings for both providers. Outlook supports a single rule with ' +
+        'FREQ=DAILY/WEEKLY/MONTHLY/YEARLY plus INTERVAL, BYDAY, BYMONTHDAY, BYMONTH, COUNT and ' +
+        'UNTIL; anything outside that is refused by name rather than silently dropped.',
       inputSchema: {
         summary: z.string().describe('Event title.'),
         start: z.string().describe('Start: ISO 8601 datetime, or YYYY-MM-DD for all-day.'),
@@ -207,7 +218,10 @@ export function registerCalendarTools(server: McpServer, user: User): void {
           .optional()
           .describe('IANA timezone, e.g. Europe/Stockholm. Recommended for timed events.'),
         attendees: z.array(z.string()).optional().describe('Attendee email addresses.'),
-        addConference: z.boolean().default(false).describe('Attach a Google Meet link.'),
+        addConference: z
+          .boolean()
+          .default(false)
+          .describe('Attach a video meeting link — Google Meet, or Teams on a Microsoft account.'),
         recurrence: z
           .array(z.string())
           .optional()
@@ -221,9 +235,8 @@ export function registerCalendarTools(server: McpServer, user: User): void {
     async (args) =>
       guard(async () => {
         const acc = resolveAccount(user, args.account);
-        const cal = await calendarClient(acc);
-        const event = await createEvent(
-          cal,
+        const cal = await calendarApi(acc);
+        const event = await cal.createEvent(
           args.calendarId,
           {
             summary: args.summary,
@@ -238,7 +251,14 @@ export function registerCalendarTools(server: McpServer, user: User): void {
           },
           args.sendUpdates,
         );
-        return ok({ created: true, account: acc.email, calendarId: args.calendarId, event });
+        const notes = sendUpdatesNote(acc.provider, args.sendUpdates);
+        return ok({
+          created: true,
+          account: acc.email,
+          calendarId: args.calendarId,
+          ...(notes.length ? { notes } : {}),
+          event,
+        });
       }),
   );
 
@@ -247,16 +267,13 @@ export function registerCalendarTools(server: McpServer, user: User): void {
     {
       title: 'Update a calendar event',
       description:
-        'Changes an existing event. Only the fields you provide are modified; everything ' +
-        'else is left alone.\n\n' +
-        'To change who is invited, use addAttendees and removeAttendees — they merge against ' +
-        'the current guest list, so everyone else keeps their RSVP and any booked room stays ' +
-        'booked. Use setAttendees only when you genuinely mean to replace the whole list.\n\n' +
-        'A meeting room is an attendee, not the location field: add or remove it by its ' +
-        'resource address (find_rooms lists the ones you have used). The location field is ' +
-        'free text and books nothing.\n\n' +
-        'For a repeating event, this changes only the one occurrence unless you pass ' +
-        'applyTo:"series".',
+        'Changes an existing event. Only the fields you provide are modified.\n\n' +
+        'addAttendees and removeAttendees merge against the current guest list, so everyone ' +
+        'else keeps their RSVP and any booked room stays booked; setAttendees replaces the ' +
+        'whole list. A room is an attendee, not the location field — book or release it by ' +
+        'its resource address (find_rooms lists yours). location is free text and books ' +
+        'nothing.\n\n' +
+        'For a repeating event this changes one occurrence unless you pass applyTo:"series".',
       inputSchema: {
         eventId: z.string().describe('Event id, from list_events.'),
         summary: z.string().optional().describe('New title.'),
@@ -323,13 +340,13 @@ export function registerCalendarTools(server: McpServer, user: User): void {
         }
 
         const acc = resolveAccount(user, args.account);
-        const cal = await calendarClient(acc);
+        const cal = await calendarApi(acc);
 
         // Resolve which object to patch: the single occurrence, or the series
         // it belongs to. Patching an instance id only ever changes that day.
         let targetId = args.eventId;
         let scope: 'instance' | 'series' | 'single' = 'single';
-        const before = await getEvent(cal, args.calendarId, args.eventId);
+        const before = await cal.getEvent(args.calendarId, args.eventId);
 
         if (before.isRecurringInstance) {
           if (args.applyTo === 'series' && before.recurringEventId) {
@@ -341,11 +358,10 @@ export function registerCalendarTools(server: McpServer, user: User): void {
         }
 
         let event = before;
-        const notes: string[] = [];
+        const notes: string[] = sendUpdatesNote(acc.provider, args.sendUpdates);
 
         if (fieldArgsGiven) {
-          event = await updateEvent(
-            cal,
+          event = await cal.updateEvent(
             args.calendarId,
             targetId,
             {
@@ -366,8 +382,7 @@ export function registerCalendarTools(server: McpServer, user: User): void {
           | undefined;
 
         if (attendeeArgsGiven > 0) {
-          const result = await changeAttendees(
-            cal,
+          const result = await cal.changeAttendees(
             args.calendarId,
             targetId,
             args.setAttendees
@@ -435,9 +450,16 @@ export function registerCalendarTools(server: McpServer, user: User): void {
     async ({ eventId, calendarId, sendUpdates, account }) =>
       guard(async () => {
         const acc = resolveAccount(user, account);
-        const cal = await calendarClient(acc);
-        await deleteEvent(cal, calendarId, eventId, sendUpdates);
-        return ok({ deleted: true, account: acc.email, calendarId, eventId });
+        const cal = await calendarApi(acc);
+        await cal.deleteEvent(calendarId, eventId, sendUpdates);
+        const notes = sendUpdatesNote(acc.provider, sendUpdates);
+        return ok({
+          deleted: true,
+          account: acc.email,
+          calendarId,
+          eventId,
+          ...(notes.length ? { notes } : {}),
+        });
       }),
   );
 
@@ -459,8 +481,8 @@ export function registerCalendarTools(server: McpServer, user: User): void {
     async ({ eventId, response, comment, calendarId, account }) =>
       guard(async () => {
         const acc = resolveAccount(user, account);
-        const cal = await calendarClient(acc);
-        const event = await respondToEvent(cal, calendarId, eventId, response, comment);
+        const cal = await calendarApi(acc);
+        const event = await cal.respondToEvent(calendarId, eventId, response, comment);
         return ok({ responded: response, account: acc.email, event });
       }),
   );
@@ -472,7 +494,10 @@ export function registerCalendarTools(server: McpServer, user: User): void {
       description:
         'Returns busy intervals across the given calendars in a time range, so you can work ' +
         'out when everyone is free. Covers multiple accounts at once, which is the usual case ' +
-        'when someone has both a work and a personal calendar.',
+        'when someone has both a work and a personal calendar.\n\n' +
+        'For a Microsoft account the entries in calendarIds must be mailbox addresses rather ' +
+        'than calendar ids — "primary" means the account\'s own address, and any colleague or ' +
+        'room address can be added to see when they are free.',
       inputSchema: {
         timeMin: z.string().describe('Start of the range, ISO 8601.'),
         timeMax: z.string().describe('End of the range, ISO 8601.'),
@@ -495,8 +520,8 @@ export function registerCalendarTools(server: McpServer, user: User): void {
         const results = await Promise.all(
           targets.map(async (acc) => {
             try {
-              const cal = await calendarClient(acc);
-              return { account: acc.email, busy: await freeBusy(cal, ids, timeMin, timeMax) };
+              const cal = await calendarApi(acc);
+              return { account: acc.email, busy: await cal.freeBusy(ids, timeMin, timeMax) };
             } catch (err) {
               if (err instanceof ReauthRequiredError) {
                 return { account: acc.email, error: 'needs_reauth', reauthUrl: err.reauthUrl };
@@ -532,7 +557,8 @@ export function registerCalendarTools(server: McpServer, user: User): void {
         'A room is booked by adding its resource address as an attendee — see create_event ' +
         'or update_event\'s addAttendees. Setting the location field does not book anything.\n\n' +
         'This finds rooms you have actually had meetings in. Listing every room in an ' +
-        'organisation requires Workspace admin rights, which this server does not have.',
+        'organisation requires Workspace or Exchange admin rights, which this server does not ' +
+        'have — so this works the same way for Google and Microsoft accounts.',
       inputSchema: {
         accounts: z
           .array(z.string())
@@ -560,8 +586,8 @@ export function registerCalendarTools(server: McpServer, user: User): void {
         const results = await Promise.all(
           targets.map(async (acc) => {
             try {
-              const cal = await calendarClient(acc);
-              const rooms = await findRoomsInHistory(cal, daysBack, 60);
+              const cal = await calendarApi(acc);
+              const rooms = await cal.findRoomsInHistory(daysBack, 60);
               return {
                 account: acc.email,
                 rooms: needle

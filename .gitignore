@@ -13,3 +13,6 @@ data/
 
 # Contains the Google client secret in plaintext
 scratchpad.md
+
+# Build artifact
+tsconfig.tsbuildinfo

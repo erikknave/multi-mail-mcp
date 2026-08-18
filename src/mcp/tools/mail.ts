@@ -2,23 +2,12 @@ import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Account, User } from '../../db/repo.js';
-import {
-  createDraft,
-  getFullMessage,
-  getThread,
-  listLabels,
-  modifyMessage,
-  modifyThread,
-  searchMessages,
-  sendMessage,
-  type OutgoingAttachment,
-  type ParsedMessage,
-} from '../../google/gmail.js';
-import { ReauthRequiredError } from '../../google/oauth.js';
+import type { OutgoingAttachment, ParsedMessage } from '../../mail/types.js';
+import { ReauthRequiredError } from '../../oauth/errors.js';
 import {
   buildDownloadUrl,
   getReadyUpload,
-  gmailClient,
+  mailApi,
   resolveAccount,
   resolveAccounts,
   ServiceError,
@@ -94,7 +83,13 @@ export function registerMailTools(server: McpServer, user: User): void {
         '`subject:"invoice" -label:spam`). Returns compact summaries sorted newest first, ' +
         'without message bodies — follow up with get_message or get_thread for full text ' +
         'and attachment details. To find mail with attachments, put `has:attachment` in the ' +
-        'query rather than filtering the results.',
+        'query rather than filtering the results.\n\n' +
+        'The same syntax works for Outlook mailboxes: from/to/cc, subject, body text, ' +
+        'has:attachment, is:unread, is:starred, in:inbox|sent|archive|trash|spam, ' +
+        'after/before, newer_than/older_than, larger/smaller and label: (which matches an ' +
+        'Outlook category) are all translated. `bcc:` is the one operator Outlook cannot ' +
+        'search; when a query uses something unsupported the response says so in ' +
+        '`queryNotes` rather than quietly ignoring it.',
       inputSchema: {
         query: z
           .string()
@@ -121,9 +116,10 @@ export function registerMailTools(server: McpServer, user: User): void {
         const perAccount = await Promise.all(
           targets.map(async (acc) => {
             try {
-              const gmail = await gmailClient(acc);
-              const results = await searchMessages(gmail, query, limit, includeSpamTrash);
-              return { account: acc.email, ok: true as const, results };
+              const api = await mailApi(acc);
+              const notes = api.explainQuery(query);
+              const results = await api.searchMessages(query, limit, includeSpamTrash);
+              return { account: acc.email, ok: true as const, results, notes };
             } catch (err) {
               // One dead mailbox must not sink a multi-account search: report it
               // inline so the agent can still use the accounts that do work.
@@ -134,6 +130,7 @@ export function registerMailTools(server: McpServer, user: User): void {
                   error: 'needs_reauth',
                   reauthUrl: err.reauthUrl,
                   results: [],
+                  notes: [],
                 };
               }
               return {
@@ -141,6 +138,7 @@ export function registerMailTools(server: McpServer, user: User): void {
                 ok: false as const,
                 error: (err as Error).message,
                 results: [],
+                notes: [],
               };
             }
           }),
@@ -158,9 +156,12 @@ export function registerMailTools(server: McpServer, user: User): void {
             ...('reauthUrl' in f && f.reauthUrl ? { reauthUrl: f.reauthUrl } : {}),
           }));
 
+        const queryNotes = [...new Set(perAccount.flatMap((r) => r.notes))];
+
         return partial(
           {
             query,
+            ...(queryNotes.length ? { queryNotes } : {}),
             searchedAccounts: targets.map((a) => a.email),
             mailboxesSearched: targets.length - problems.length,
             mailboxesRequested: targets.length,
@@ -185,7 +186,7 @@ export function registerMailTools(server: McpServer, user: User): void {
         'Fetches a single message with its full body and attachment list. Each attachment ' +
         'comes with a time-limited downloadUrl that can be given to the user or fetched directly.',
       inputSchema: {
-        messageId: z.string().describe('Gmail message id, from search_messages.'),
+        messageId: z.string().describe('Message id, from search_messages.'),
         account: accountArg,
         maxBodyChars: z
           .number()
@@ -200,8 +201,8 @@ export function registerMailTools(server: McpServer, user: User): void {
     async ({ messageId, account, maxBodyChars }) =>
       guard(async () => {
         const acc = resolveAccount(user, account);
-        const gmail = await gmailClient(acc);
-        const msg = await getFullMessage(gmail, messageId);
+        const api = await mailApi(acc);
+        const msg = await api.getMessage(messageId);
         return ok(presentMessage(user, acc, msg, maxBodyChars));
       }),
   );
@@ -214,7 +215,9 @@ export function registerMailTools(server: McpServer, user: User): void {
         'Fetches every message in a conversation, oldest first, with bodies and attachments. ' +
         'Prefer this over repeated get_message calls when you need the context of an exchange.',
       inputSchema: {
-        threadId: z.string().describe('Gmail thread id, from search_messages.'),
+        threadId: z
+          .string()
+          .describe('Thread id, from search_messages. For Outlook this is the conversation id.'),
         account: accountArg,
         maxBodyChars: z
           .number()
@@ -229,8 +232,8 @@ export function registerMailTools(server: McpServer, user: User): void {
     async ({ threadId, account, maxBodyChars }) =>
       guard(async () => {
         const acc = resolveAccount(user, account);
-        const gmail = await gmailClient(acc);
-        const thread = await getThread(gmail, threadId);
+        const api = await mailApi(acc);
+        const thread = await api.getThread(threadId);
         return ok({
           account: acc.email,
           threadId: thread.threadId,
@@ -246,15 +249,18 @@ export function registerMailTools(server: McpServer, user: User): void {
       title: 'List labels',
       description:
         'Lists the labels available in a mailbox, with their ids. Label ids are what ' +
-        'modify_labels expects (system labels like INBOX, UNREAD, STARRED use their name as id).',
+        'modify_labels expects (system labels like INBOX, UNREAD, STARRED use their name as id).\n\n' +
+        'For an Outlook mailbox the same system names are accepted and folders and categories ' +
+        'are listed alongside them: moving a message to a folder and adding a category are ' +
+        'both done by passing the id from this list to modify_labels.',
       inputSchema: { account: accountArg },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
     async ({ account }) =>
       guard(async () => {
         const acc = resolveAccount(user, account);
-        const gmail = await gmailClient(acc);
-        return ok({ account: acc.email, labels: await listLabels(gmail) });
+        const api = await mailApi(acc);
+        return ok({ account: acc.email, provider: acc.provider, labels: await api.listLabels() });
       }),
   );
 
@@ -268,10 +274,10 @@ export function registerMailTools(server: McpServer, user: User): void {
       title: 'Get a download link for an attachment',
       description:
         'Produces a time-limited direct download URL for one attachment. Use the attachmentId ' +
-        'from get_message or get_thread. The URL streams the file from Gmail on demand — ' +
+        'from get_message or get_thread. The URL streams the file from the mailbox on demand — ' +
         'nothing is stored on the server.',
       inputSchema: {
-        messageId: z.string().describe('Gmail message id the attachment belongs to.'),
+        messageId: z.string().describe('Message id the attachment belongs to.'),
         attachmentId: z.string().describe('Attachment id, from get_message or get_thread.'),
         filename: z.string().describe('Filename to serve the download as.'),
         mimeType: z.string().default('application/octet-stream').describe('Content type.'),
@@ -305,7 +311,12 @@ export function registerMailTools(server: McpServer, user: User): void {
       description:
         'Adds and removes labels. Covers the common operations: archive (remove INBOX), ' +
         'mark read (remove UNREAD), mark unread (add UNREAD), star (add STARRED), ' +
-        'move to trash (add TRASH). Nothing is permanently deleted.',
+        'move to trash (add TRASH). Nothing is permanently deleted.\n\n' +
+        'The same operations work on an Outlook mailbox, where they become a folder move or a ' +
+        'flag: INBOX/SENT/DRAFT/TRASH/SPAM/ARCHIVE map to the matching folders, UNREAD and ' +
+        'STARRED to the read and flagged state, and any other id from list_labels to either a ' +
+        'folder move or a category. A message lives in exactly one Outlook folder, so a change ' +
+        'that would move it to two at once is refused rather than half-applied.',
       inputSchema: {
         messageId: z.string().optional().describe('Message to modify. Give this or threadId.'),
         threadId: z
@@ -328,15 +339,33 @@ export function registerMailTools(server: McpServer, user: User): void {
         }
 
         const acc = resolveAccount(user, account);
-        const gmail = await gmailClient(acc);
+        const api = await mailApi(acc);
 
         if (threadId) {
-          await modifyThread(gmail, threadId, addLabelIds, removeLabelIds);
+          await api.modifyThread(threadId, addLabelIds, removeLabelIds);
           return ok({ account: acc.email, threadId, addLabelIds, removeLabelIds, applied: true });
         }
 
-        const labels = await modifyMessage(gmail, messageId!, addLabelIds, removeLabelIds);
-        return ok({ account: acc.email, messageId, labelIds: labels, applied: true });
+        const result = await api.modifyMessage(messageId!, addLabelIds, removeLabelIds);
+        const moved = result.messageId !== messageId;
+
+        return ok({
+          account: acc.email,
+          // Not the id that was passed in: an Outlook message that changes
+          // folder is reissued under a new one, and echoing the old id back
+          // would hand the caller a dead reference to its own message.
+          messageId: result.messageId,
+          ...(moved
+            ? {
+                previousMessageId: messageId,
+                note:
+                  'Moving the message gave it a new id. Use messageId above from now on; ' +
+                  'the previous one no longer resolves.',
+              }
+            : {}),
+          labelIds: result.labelIds,
+          applied: true,
+        });
       }),
   );
 
@@ -392,21 +421,21 @@ export function registerMailTools(server: McpServer, user: User): void {
     {
       title: 'Send an email',
       description:
-        'Sends an email from one of the connected mailboxes. To attach files, first call ' +
-        'create_upload_url, have the file PUT to that URL, then pass the uploadId here. ' +
-        'To reply within a thread, pass threadId plus the inReplyTo and references values ' +
-        'from get_message. This sends immediately — use create_draft if the user should review first.',
+        'Sends an email from one of the connected mailboxes, Google or Microsoft. To attach ' +
+        'files, first call create_upload_url, have the file PUT to that URL, then pass the ' +
+        'uploadId here. To reply within a thread, pass threadId plus the inReplyTo and ' +
+        'references values from get_message — both providers use them to thread correctly. ' +
+        'This sends immediately — use create_draft if the user should review first.',
       inputSchema: composeSchema,
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
     async (args) =>
       guard(async () => {
         const acc = resolveAccount(user, args.account);
-        const gmail = await gmailClient(acc);
+        const api = await mailApi(acc);
         const attachments = await collectAttachments(args.uploadIds);
 
-        const result = await sendMessage(
-          gmail,
+        const result = await api.send(
           {
             from: acc.display_name ? `${acc.display_name} <${acc.email}>` : acc.email,
             to: args.to,
@@ -425,7 +454,17 @@ export function registerMailTools(server: McpServer, user: User): void {
         return ok({
           sent: true,
           account: acc.email,
-          messageId: result.id,
+          // Outlook files a sent message in Sent Items a moment after sending,
+          // so the id is occasionally not there yet. Saying null and how to
+          // find it beats an empty string the caller would pass to get_message.
+          messageId: result.id || null,
+          ...(result.id
+            ? {}
+            : {
+                messageIdNote:
+                  'The message was sent. Its id was not available yet — Outlook files it in ' +
+                  'Sent Items a moment later. Use get_thread with the threadId to find it.',
+              }),
           threadId: result.threadId,
           to: args.to,
           subject: args.subject,
@@ -447,11 +486,10 @@ export function registerMailTools(server: McpServer, user: User): void {
     async (args) =>
       guard(async () => {
         const acc = resolveAccount(user, args.account);
-        const gmail = await gmailClient(acc);
+        const api = await mailApi(acc);
         const attachments = await collectAttachments(args.uploadIds);
 
-        const result = await createDraft(
-          gmail,
+        const result = await api.createDraft(
           {
             from: acc.display_name ? `${acc.display_name} <${acc.email}>` : acc.email,
             to: args.to,

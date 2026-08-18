@@ -3,13 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "MCP server giving access to multiple Gmail/Google Workspace accounts: mail search, threads, calendars and attachments.",
+  "description": "MCP server giving access to multiple Gmail/Google Workspace and Microsoft 365/Outlook accounts: mail search, threads, calendars and attachments.",
   "scripts": {
     "build": "tsc && cp src/db/schema.sql dist/db/schema.sql",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/**/*.test.ts",
+    "test": "tsx --test src/*.test.ts",
     "cli": "tsx src/cli.ts"
   },
   "dependencies": {

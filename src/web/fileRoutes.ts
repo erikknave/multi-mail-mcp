@@ -1,11 +1,10 @@
 import { createReadStream } from 'node:fs';
 import { Hono } from 'hono';
 import { accounts, uploads, users } from '../db/repo.js';
-import { getAttachment } from '../google/gmail.js';
 import { extensionForExport, getFileBytes, getFileMetadata } from '../google/drive.js';
 import {
   driveClient,
-  gmailClient,
+  mailApi,
   parseDownloadToken,
   parseDriveDownloadToken,
   parseUploadToken,
@@ -16,8 +15,9 @@ import {
 export const fileRoutes = new Hono();
 
 /**
- * Streams an attachment straight from Gmail. Nothing is cached on disk, so the
- * only thing that grants access is the signed token in the path.
+ * Streams an attachment straight from the mailbox it lives in, Gmail or
+ * Outlook. Nothing is cached on disk, so the only thing that grants access is
+ * the signed token in the path.
  */
 fileRoutes.get('/files/attachment/:token', async (c) => {
   const payload = parseDownloadToken(c.req.param('token'));
@@ -30,8 +30,8 @@ fileRoutes.get('/files/attachment/:token', async (c) => {
   }
 
   try {
-    const gmail = await gmailClient(account);
-    const data = await getAttachment(gmail, payload.mid, payload.att);
+    const api = await mailApi(account);
+    const data = await api.getAttachment(payload.mid, payload.att);
 
     // filename* uses RFC 5987 so non-ASCII names survive; the plain filename is
     // an ASCII-safe fallback for older clients.

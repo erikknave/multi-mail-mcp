@@ -1,7 +1,8 @@
 /**
- * Unit tests for the pure logic — MIME assembly, token signing, payload parsing
- * and filename handling. Anything that talks to Google is verified by hand
- * against a live account instead, since it needs real credentials.
+ * Unit tests for the pure logic — MIME assembly, token signing, payload parsing,
+ * query translation and filename handling. Anything that talks to Google or
+ * Microsoft is verified by hand against a live account instead, since it needs
+ * real credentials.
  *
  * Run with: npm test
  */
@@ -577,7 +578,8 @@ test('deletion is always reversible', async () => {
 test('an account is only granted a capability its stored scopes cover', async () => {
   const { hasCapability } = await import('./google/oauth.js');
   const base = {
-    id: 'a', user_id: 'u', email: 'x@y.com', google_sub: null, display_name: null,
+    id: 'a', user_id: 'u', email: 'x@y.com', provider: 'google' as const, provider_sub: null,
+    display_name: null,
     refresh_token_enc: null, access_token_enc: null, access_token_expires: null,
     status: 'active' as const, last_error: null, last_ok_at: null, created_at: 0, updated_at: 0,
   };
@@ -595,12 +597,16 @@ test('an account is only granted a capability its stored scopes cover', async ()
   assert.equal(hasCapability(narrow, 'drive'), false, 'drive.file must not satisfy full drive');
 });
 
-test('Drive is part of the requested scope set', async () => {
+test('every capability Google supports is in the requested scope set', async () => {
   const { GOOGLE_SCOPES, SCOPE_FOR } = await import('./config.js');
-  assert.ok(
-    (GOOGLE_SCOPES as readonly string[]).includes(SCOPE_FOR.drive),
-    'consent must request the Drive scope, or no account can ever grant it',
-  );
+
+  for (const [capability, scope] of Object.entries(SCOPE_FOR)) {
+    if (scope === null) continue;
+    assert.ok(
+      (GOOGLE_SCOPES as readonly string[]).includes(scope),
+      `consent must request ${scope}, or no account can ever grant ${capability}`,
+    );
+  }
 });
 
 /* ------------------------------------------------------------------ *
@@ -940,4 +946,990 @@ test('the spreadsheet mask nests its sub-selection', async () => {
     /'sheets\.properties\(/,
     'sheets.properties(...) is the invalid form that broke list_sheet_tabs',
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * Microsoft: query translation
+ *
+ * The tools promise one query language across both providers, so these check
+ * that a Gmail-shaped query keeps its meaning rather than quietly losing terms.
+ * ------------------------------------------------------------------ */
+
+test('a Gmail query becomes KQL when it needs full-text matching', async () => {
+  const { translateQuery } = await import('./microsoft/query.js');
+
+  const t = translateQuery('from:anna@example.com after:2026/01/01 has:attachment');
+  assert.equal(t.mode, 'search');
+  assert.match(t.kql!, /from:anna@example\.com/);
+  assert.match(t.kql!, /received>=2026-01-01/);
+  assert.match(t.kql!, /hasAttachments:true/);
+  assert.equal(t.unsupported.length, 0);
+});
+
+test('a query of only filterable terms is filtered, so results stay date-ordered', async () => {
+  const { translateQuery } = await import('./microsoft/query.js');
+
+  const t = translateQuery('is:unread has:attachment');
+  assert.equal(t.mode, 'filter', '$search would forbid $orderby and scramble the order');
+  assert.match(t.odataFilter!, /hasAttachments eq true/);
+  assert.match(t.odataFilter!, /isRead eq false/);
+  // Already in the query; applying it again afterwards would be misleading.
+  assert.equal(t.requireUnread, null);
+});
+
+test('read state survives a query that has to use search', async () => {
+  const { translateQuery } = await import('./microsoft/query.js');
+
+  const t = translateQuery('is:unread from:anna');
+  assert.equal(t.mode, 'search');
+  assert.match(t.kql!, /from:anna/);
+  assert.equal(t.requireUnread, true, 'KQL cannot express unread, so it must be applied after');
+});
+
+test('folder words map to Outlook folders, and labels to categories', async () => {
+  const { translateQuery } = await import('./microsoft/query.js');
+
+  assert.equal(translateQuery('in:trash').folder, 'deleteditems');
+  assert.equal(translateQuery('in:spam').folder, 'junkemail');
+  assert.equal(translateQuery('in:sent').folder, 'sentitems');
+
+  const label = translateQuery('label:Kunder');
+  assert.match(label.kql!, /category:Kunder/);
+});
+
+test('an operator Outlook cannot honour is reported, not silently dropped', async () => {
+  const { translateQuery } = await import('./microsoft/query.js');
+
+  const t = translateQuery('bcc:anna@example.com subject:invoice');
+  assert.equal(t.unsupported.length, 1);
+  assert.match(t.unsupported[0]!, /bcc/);
+  assert.doesNotMatch(t.kql!, /bcc/, 'the term must not leak into the query as free text');
+});
+
+test('negation is carried through both query forms', async () => {
+  const { translateQuery } = await import('./microsoft/query.js');
+
+  assert.match(translateQuery('-from:noreply@example.com other').kql!, /NOT from:noreply@example\.com/);
+  assert.match(translateQuery('-has:attachment').odataFilter!, /not \(hasAttachments eq true\)/);
+});
+
+test('relative dates are resolved against a fixed reference', async () => {
+  const { translateQuery } = await import('./microsoft/query.js');
+
+  const t = translateQuery('newer_than:7d', new Date('2026-08-18T12:00:00Z'));
+  assert.match(t.odataFilter!, /receivedDateTime ge 2026-08-11T00:00:00Z/);
+});
+
+test('an empty query lists recent mail rather than searching for nothing', async () => {
+  const { translateQuery } = await import('./microsoft/query.js');
+
+  const t = translateQuery('');
+  assert.equal(t.mode, 'filter');
+  assert.equal(t.odataFilter, null);
+  assert.equal(t.kql, null);
+});
+
+test('a quoted phrase stays one term', async () => {
+  const { translateQuery } = await import('./microsoft/query.js');
+
+  const t = translateQuery('subject:"quarterly report"');
+  assert.match(t.kql!, /subject:"quarterly report"/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Microsoft: capabilities
+ * ------------------------------------------------------------------ */
+
+const microsoftAccount = (scopes: string) => ({
+  id: 'm', user_id: 'u', email: 'x@corp.com', provider: 'microsoft' as const, provider_sub: null,
+  display_name: null, refresh_token_enc: null, access_token_enc: null, access_token_expires: null,
+  status: 'active' as const, last_error: null, last_ok_at: null, created_at: 0, updated_at: 0,
+  scopes,
+});
+
+test('Graph scopes are recognised however Microsoft qualifies them', async () => {
+  const { hasCapability } = await import('./oauth/capabilities.js');
+
+  // Microsoft echoes scopes back fully qualified and not always in the casing
+  // they were requested in.
+  const account = microsoftAccount(
+    'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/calendars.readwrite',
+  );
+  assert.equal(hasCapability(account, 'gmail'), true);
+  assert.equal(hasCapability(account, 'calendar'), true);
+});
+
+test('a Google scope never satisfies a Microsoft account, or the reverse', async () => {
+  const { hasCapability } = await import('./oauth/capabilities.js');
+
+  const confused = microsoftAccount('https://www.googleapis.com/auth/gmail.modify');
+  assert.equal(hasCapability(confused, 'gmail'), false);
+});
+
+test('Drive against a Microsoft mailbox is unsupported, not a missing permission', async () => {
+  const { requireCapability } = await import('./oauth/capabilities.js');
+  const { ScopeMissingError, UnsupportedForProviderError } = await import('./oauth/errors.js');
+
+  const account = microsoftAccount('https://graph.microsoft.com/Mail.ReadWrite');
+
+  assert.throws(
+    () => requireCapability(account, 'drive'),
+    (err: unknown) => {
+      // The distinction matters: a ScopeMissingError sends the user off to
+      // re-consent, which could never make OneDrive appear behind these tools.
+      assert.ok(err instanceof UnsupportedForProviderError);
+      assert.ok(!(err instanceof ScopeMissingError));
+      return true;
+    },
+  );
+});
+
+test('every capability Microsoft supports is in the requested scope set', async () => {
+  const { GRAPH_SCOPES, GRAPH_SCOPE_FOR } = await import('./config.js');
+
+  for (const [capability, scope] of Object.entries(GRAPH_SCOPE_FOR)) {
+    if (scope === null) continue;
+    assert.ok(
+      (GRAPH_SCOPES as readonly string[]).includes(scope),
+      `consent must request ${scope}, or no account can ever grant ${capability}`,
+    );
+  }
+  assert.ok(
+    (GRAPH_SCOPES as readonly string[]).includes('offline_access'),
+    'without offline_access there is no refresh token and every grant dies within the hour',
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * Microsoft: recurrence
+ * ------------------------------------------------------------------ */
+
+test('a weekly RRULE becomes an Outlook weekly pattern', async () => {
+  const { rruleToGraph } = await import('./microsoft/recurrence.js');
+
+  const r = rruleToGraph(['RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,TH;COUNT=10'], '2026-08-18');
+  assert.equal(r.pattern.type, 'weekly');
+  assert.equal(r.pattern.interval, 2);
+  assert.deepEqual(r.pattern.daysOfWeek, ['tuesday', 'thursday']);
+  assert.equal(r.range.type, 'numbered');
+  assert.equal(r.range.numberOfOccurrences, 10);
+});
+
+test('a weekly rule without BYDAY repeats on the start date\'s weekday', async () => {
+  const { rruleToGraph } = await import('./microsoft/recurrence.js');
+
+  // 2026-08-18 is a Tuesday; leaving daysOfWeek empty would be rejected by Graph.
+  const r = rruleToGraph(['RRULE:FREQ=WEEKLY'], '2026-08-18');
+  assert.deepEqual(r.pattern.daysOfWeek, ['tuesday']);
+});
+
+test('an ordinal monthly rule becomes a relative pattern', async () => {
+  const { rruleToGraph } = await import('./microsoft/recurrence.js');
+
+  const r = rruleToGraph(['RRULE:FREQ=MONTHLY;BYDAY=2TU'], '2026-08-11');
+  assert.equal(r.pattern.type, 'relativeMonthly');
+  assert.equal(r.pattern.index, 'second');
+  assert.deepEqual(r.pattern.daysOfWeek, ['tuesday']);
+
+  const last = rruleToGraph(['RRULE:FREQ=MONTHLY;BYDAY=-1FR'], '2026-08-28');
+  assert.equal(last.pattern.index, 'last');
+});
+
+test('UNTIL becomes an end date', async () => {
+  const { rruleToGraph } = await import('./microsoft/recurrence.js');
+
+  const r = rruleToGraph(['RRULE:FREQ=DAILY;UNTIL=20260901T000000Z'], '2026-08-18');
+  assert.equal(r.range.type, 'endDate');
+  assert.equal(r.range.endDate, '2026-09-01');
+});
+
+test('a rule Outlook cannot express is refused by name', async () => {
+  const { rruleToGraph } = await import('./microsoft/recurrence.js');
+
+  assert.throws(
+    () => rruleToGraph(['RRULE:FREQ=HOURLY'], '2026-08-18'),
+    /FREQ=HOURLY/,
+    'silently dropping the rule would create a single event where a series was asked for',
+  );
+  assert.throws(() => rruleToGraph(['RRULE:FREQ=DAILY', 'RRULE:FREQ=WEEKLY'], '2026-08-18'), /single/);
+});
+
+test('an Outlook pattern reads back as the RRULE that produced it', async () => {
+  const { rruleToGraph, graphToRrule } = await import('./microsoft/recurrence.js');
+
+  const original = 'RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,TH;COUNT=10';
+  const back = graphToRrule(rruleToGraph([original], '2026-08-18'));
+  assert.deepEqual(back, [original]);
+});
+
+/* ------------------------------------------------------------------ *
+ * Microsoft: event mapping
+ * ------------------------------------------------------------------ */
+
+test('an Outlook event maps onto the same shape a Google one does', async () => {
+  const { toEventSummary } = await import('./microsoft/calendar.js');
+
+  const event = toEventSummary(
+    {
+      id: 'AAMk',
+      subject: 'Sprint planning',
+      start: { dateTime: '2026-08-18T09:00:00.0000000', timeZone: 'UTC' },
+      end: { dateTime: '2026-08-18T10:00:00.0000000', timeZone: 'UTC' },
+      isAllDay: false,
+      isOrganizer: true,
+      organizer: { emailAddress: { address: 'me@corp.com', name: 'Me' } },
+      onlineMeeting: { joinUrl: 'https://teams.microsoft.com/l/x' },
+      responseStatus: { response: 'organizer' },
+      attendees: [
+        {
+          type: 'required',
+          status: { response: 'tentativelyAccepted' },
+          emailAddress: { address: 'anna@corp.com', name: 'Anna' },
+        },
+        {
+          type: 'resource',
+          status: { response: 'accepted' },
+          emailAddress: { address: 'room-reef@corp.com', name: 'Reef (12)' },
+        },
+      ],
+    },
+    'me@corp.com',
+  );
+
+  assert.equal(event.start, '2026-08-18T09:00:00.000Z');
+  assert.equal(event.hangoutLink, 'https://teams.microsoft.com/l/x');
+  // Outlook's words translated into the ones every tool description promises.
+  assert.equal(event.attendees[0]!.responseStatus, 'tentative');
+  assert.equal(event.selfResponseStatus, 'accepted');
+  assert.equal(event.rooms.length, 1, 'a room must stay distinguishable from a person');
+  assert.equal(event.rooms[0]!.email, 'room-reef@corp.com');
+  assert.equal(event.attendees[1]!.isResource, true);
+});
+
+test('an all-day event keeps its date whatever zone it is read in', async () => {
+  const { toEventSummary } = await import('./microsoft/calendar.js');
+
+  // Stockholm midnight on the 18th is 22:00 UTC on the 17th; taking the UTC
+  // date directly would report the event a day early.
+  const stockholm = toEventSummary(
+    {
+      id: '1',
+      isAllDay: true,
+      start: { dateTime: '2026-08-17T22:00:00.0000000', timeZone: 'UTC' },
+      end: { dateTime: '2026-08-18T22:00:00.0000000', timeZone: 'UTC' },
+    },
+    'me@corp.com',
+  );
+  assert.equal(stockholm.allDay, true);
+  assert.equal(stockholm.start, '2026-08-18');
+  assert.equal(stockholm.end, '2026-08-19');
+
+  // And the same holds for a zone behind UTC.
+  const losAngeles = toEventSummary(
+    {
+      id: '2',
+      isAllDay: true,
+      start: { dateTime: '2026-08-18T07:00:00.0000000', timeZone: 'UTC' },
+      end: { dateTime: '2026-08-19T07:00:00.0000000', timeZone: 'UTC' },
+    },
+    'me@corp.com',
+  );
+  assert.equal(losAngeles.start, '2026-08-18');
+});
+
+test('an occurrence reports the series it belongs to', async () => {
+  const { toEventSummary } = await import('./microsoft/calendar.js');
+
+  const occurrence = toEventSummary(
+    { id: 'occ', type: 'occurrence', seriesMasterId: 'master' },
+    'me@corp.com',
+  );
+  assert.equal(occurrence.isRecurringInstance, true);
+  assert.equal(occurrence.recurringEventId, 'master');
+
+  const single = toEventSummary({ id: 'one', type: 'singleInstance' }, 'me@corp.com');
+  assert.equal(single.isRecurringInstance, false);
+});
+
+test('a Microsoft consent URL is distinct from a Google one and cannot be replayed at it', async () => {
+  process.env.MICROSOFT_CLIENT_ID = 'ms-client';
+  process.env.MICROSOFT_CLIENT_SECRET = 'ms-secret';
+
+  const { signToken, verifyToken } = await import('./crypto.js');
+
+  // The two callbacks use different state kinds, so a token minted for one is
+  // rejected by the other rather than exchanged against the wrong credentials.
+  const googleState = signToken({ k: 'oauth_state', exp: Math.floor(Date.now() / 1000) + 60, uid: 'u' });
+  assert.equal(verifyToken(googleState, 'ms_oauth_state'), null);
+});
+
+/* ------------------------------------------------------------------ *
+ * Teams chat: which mailboxes can use it
+ * ------------------------------------------------------------------ */
+
+const googleAccount = (scopes: string) => ({
+  id: 'g', user_id: 'u', email: 'erik@dibbla.com', provider: 'google' as const, provider_sub: null,
+  display_name: null, refresh_token_enc: null, access_token_enc: null, access_token_expires: null,
+  status: 'active' as const, last_error: null, last_ok_at: null, created_at: 0, updated_at: 0,
+  scopes,
+});
+
+const ALL_GOOGLE_SCOPES =
+  'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar ' +
+  'https://www.googleapis.com/auth/drive';
+
+test('chat against a Google mailbox is unsupported, and names Teams rather than Google Chat', async () => {
+  const { requireCapability } = await import('./oauth/capabilities.js');
+  const { ScopeMissingError, UnsupportedForProviderError } = await import('./oauth/errors.js');
+
+  assert.throws(
+    () => requireCapability(googleAccount(ALL_GOOGLE_SCOPES), 'chat'),
+    (err: unknown) => {
+      assert.ok(err instanceof UnsupportedForProviderError);
+      // A ScopeMissingError would hand the user a renewal link, and no amount of
+      // Google consent will ever put Teams chat behind these tools.
+      assert.ok(!(err instanceof ScopeMissingError));
+      assert.match((err as Error).message, /Teams chat/);
+      assert.match((err as Error).message, /Microsoft mailbox/);
+      return true;
+    },
+  );
+});
+
+test('a Microsoft mailbox connected before chat existed is told to extend, not that it is impossible', async () => {
+  const { requireCapability } = await import('./oauth/capabilities.js');
+  const { ScopeMissingError } = await import('./oauth/errors.js');
+
+  // Mail and calendar only: the grant is alive but predates Chat.ReadWrite.
+  const older = microsoftAccount(
+    'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite',
+  );
+  assert.throws(() => requireCapability(older, 'chat'), ScopeMissingError);
+
+  const current = microsoftAccount(
+    'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Chat.ReadWrite',
+  );
+  assert.doesNotThrow(() => requireCapability(current, 'chat'));
+});
+
+test('each account reports only the capabilities it really has', async () => {
+  const { capabilitiesOf } = await import('./oauth/capabilities.js');
+
+  assert.deepEqual(capabilitiesOf(googleAccount(ALL_GOOGLE_SCOPES)), [
+    'gmail',
+    'calendar',
+    'drive',
+  ]);
+
+  assert.deepEqual(
+    capabilitiesOf(
+      microsoftAccount(
+        'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite ' +
+          'https://graph.microsoft.com/Chat.ReadWrite',
+      ),
+    ),
+    ['gmail', 'calendar', 'chat'],
+    'a Microsoft account must never claim drive, whatever it granted',
+  );
+});
+
+test('a mixed set of mailboxes splits into the ones that can chat and the ones that cannot', async () => {
+  const { splitByCapability } = await import('./service.js');
+
+  const google = googleAccount(ALL_GOOGLE_SCOPES);
+  const chatty = { ...microsoftAccount('https://graph.microsoft.com/Chat.ReadWrite'), email: 'a@corp.com' };
+  const stale = { ...microsoftAccount('https://graph.microsoft.com/Mail.ReadWrite'), email: 'b@corp.com' };
+
+  const { capable, skipped } = splitByCapability([google, chatty, stale], 'chat');
+
+  assert.deepEqual(capable.map((a) => a.email), ['a@corp.com']);
+  assert.equal(skipped.length, 2);
+
+  // The two reasons must read differently: one is permanent, the other is a
+  // click away, and an agent that conflates them gives the wrong advice.
+  const forGoogle = skipped.find((s) => s.account === 'erik@dibbla.com')!;
+  const forStale = skipped.find((s) => s.account === 'b@corp.com')!;
+  assert.match(forGoogle.reason, /do not have this capability/);
+  assert.match(forStale.reason, /needs its permission extending/);
+  assert.match(forStale.reason, /reauth/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Teams chat: mapping, driven through a stubbed Graph
+ * ------------------------------------------------------------------ */
+
+/** A Graph that answers from fixtures, so the mapping can be tested offline. */
+function stubGraph(routes: Record<string, unknown>) {
+  const find = (path: string) => {
+    const key = Object.keys(routes).find((k) => path.startsWith(k));
+    if (key === undefined) throw new Error(`stub Graph has no fixture for ${path}`);
+    return routes[key];
+  };
+  return {
+    account: {} as never,
+    get: async (path: string) => find(path),
+    getAll: async (path: string) => (find(path) as { value: unknown[] }).value,
+    post: async (path: string) => find(path),
+    postNoContent: async () => undefined,
+    patch: async (path: string) => find(path),
+    del: async () => undefined,
+    getBinary: async () => Buffer.alloc(0),
+    putRange: async () => new Response(null, { status: 201 }),
+  } as never;
+}
+
+const AAD = '#microsoft.graph.aadUserConversationMember';
+
+test('a participant from another tenant is flagged external, one from ours is not', async () => {
+  const { microsoftChatApi } = await import('./microsoft/chat.js');
+
+  const api = microsoftChatApi(
+    stubGraph({
+      '/me/chats': {
+        value: [
+          {
+            id: 'chat-external',
+            chatType: 'group',
+            topic: 'Leverans Q3',
+            lastUpdatedDateTime: '2026-08-18T10:00:00Z',
+            members: [
+              { '@odata.type': AAD, displayName: 'Erik', email: 'erik@corp.com', tenantId: 'T1' },
+              { '@odata.type': AAD, displayName: 'Kund', email: 'anna@kund.se', tenantId: 'T2' },
+            ],
+          },
+          {
+            id: 'chat-internal',
+            chatType: 'oneOnOne',
+            lastUpdatedDateTime: '2026-08-17T10:00:00Z',
+            members: [
+              { '@odata.type': AAD, displayName: 'Erik', email: 'erik@corp.com', tenantId: 'T1' },
+              { '@odata.type': AAD, displayName: 'Jon', email: 'jon@corp.com', tenantId: 'T1' },
+            ],
+          },
+        ],
+      },
+    }),
+    'erik@corp.com',
+  );
+
+  const [external, internal] = await api.listChats(10);
+
+  assert.equal(external!.id, 'chat-external', 'chats must come back most recent first');
+  assert.equal(external!.isExternal, true);
+  assert.deepEqual(external!.externalParticipants, ['Kund <anna@kund.se>']);
+
+  assert.equal(internal!.isExternal, false);
+  assert.deepEqual(internal!.externalParticipants, []);
+  assert.equal(internal!.participants.find((p) => p.isSelf)?.email, 'erik@corp.com');
+});
+
+test('a participant whose tenant is unknown counts as external', async () => {
+  const { microsoftChatApi } = await import('./microsoft/chat.js');
+
+  const api = microsoftChatApi(
+    stubGraph({
+      '/me/chats': {
+        value: [
+          {
+            id: 'c',
+            chatType: 'meeting',
+            members: [
+              { '@odata.type': AAD, displayName: 'Erik', email: 'erik@corp.com', tenantId: 'T1' },
+              // A federated contact with no tenant reported, and a bot.
+              { '@odata.type': AAD, displayName: 'Okänd', email: 'x@elsewhere.com', tenantId: null },
+              { '@odata.type': '#microsoft.graph.appConversationMember', displayName: 'Polly' },
+            ],
+          },
+        ],
+      },
+    }),
+    'erik@corp.com',
+  );
+
+  const [chat] = await api.listChats(10);
+  assert.equal(chat!.isExternal, true);
+  assert.deepEqual(chat!.externalParticipants, ['Okänd <x@elsewhere.com>', 'Polly']);
+});
+
+test('chat messages are converted to text and returned in reading order', async () => {
+  const { microsoftChatApi } = await import('./microsoft/chat.js');
+
+  const api = microsoftChatApi(
+    stubGraph({
+      '/chats/c/messages': {
+        // Graph hands these back newest-first.
+        value: [
+          {
+            id: 'm2',
+            messageType: 'message',
+            createdDateTime: '2026-08-18T10:05:00Z',
+            from: { user: { displayName: 'Anna' } },
+            body: { contentType: 'html', content: '<div>Ja, det <b>funkar</b>.</div>' },
+            mentions: [{ mentionText: 'Erik' }],
+          },
+          {
+            id: 'm1',
+            messageType: 'message',
+            createdDateTime: '2026-08-18T10:00:00Z',
+            from: { user: { displayName: 'Erik' } },
+            body: { contentType: 'html', content: '<div>Hinner du titta p&aring; det?</div>' },
+            attachments: [
+              { name: 'offert.pdf', contentType: 'application/pdf', contentUrl: 'https://sp/offert.pdf' },
+            ],
+          },
+          {
+            id: 'sys',
+            messageType: 'systemEventMessage',
+            createdDateTime: '2026-08-18T09:59:00Z',
+            body: { contentType: 'html', content: '<systemEventMessage/>' },
+          },
+        ],
+      },
+    }),
+    'erik@corp.com',
+  );
+
+  const messages = await api.listMessages('c', 10);
+
+  assert.deepEqual(messages.map((m) => m.id), ['sys', 'm1', 'm2']);
+  assert.equal(messages[1]!.bodyText, 'Hinner du titta på det?');
+  assert.equal(messages[1]!.bodyIsHtmlFallback, true);
+  assert.equal(messages[2]!.bodyText, 'Ja, det funkar.');
+  assert.deepEqual(messages[2]!.mentions, ['Erik']);
+  // The file is a link, not something the server can fetch.
+  assert.equal(messages[1]!.attachments[0]!.url, 'https://sp/offert.pdf');
+  assert.equal(messages[0]!.isSystemEvent, true, 'a system event must be distinguishable from speech');
+});
+
+test('an empty chat message is refused rather than posted', async () => {
+  const { microsoftChatApi } = await import('./microsoft/chat.js');
+
+  const api = microsoftChatApi(stubGraph({}), 'erik@corp.com');
+  await assert.rejects(() => api.sendMessage('c', { body: '   ' }), /empty chat message/);
+});
+
+test('HTML entities decode, including the ones Swedish mail is full of', async () => {
+  const { htmlToText } = await import('./html.js');
+
+  assert.equal(htmlToText('<p>Hinner du titta p&aring; det?</p>'), 'Hinner du titta på det?');
+  assert.equal(htmlToText('<div>&#229;&#228;&#246; &#xE5;</div>'), 'åäö å');
+  assert.equal(htmlToText('<p>caf&eacute; &mdash; 5&nbsp;kr</p>'), 'café — 5 kr');
+
+  // Decoding in one pass: a literal, escaped entity must survive as written
+  // rather than being decoded a second time into a character nobody sent.
+  assert.equal(htmlToText('<p>&amp;#229;</p>'), '&#229;');
+  assert.equal(htmlToText('<p>&amp;lt;</p>'), '&lt;');
+
+  // An unknown name is more likely to be text than a missed entity.
+  assert.equal(htmlToText('<p>R&D;Q</p>'), 'R&D;Q');
+});
+
+/* ------------------------------------------------------------------ *
+ * Microsoft: folder resolution
+ *
+ * Regression cover for a bug that took every mail call down: `wellKnownName`
+ * exists on mailFolder in the Graph beta endpoint but not in v1.0, and naming
+ * an unknown property in $select fails the whole request rather than returning
+ * null for it.
+ * ------------------------------------------------------------------ */
+
+/**
+ * A stub Graph that refuses beta-only properties exactly as v1.0 does, so a
+ * request naming one fails the test instead of only failing in production.
+ */
+function v1OnlyGraph(routes: Record<string, unknown>) {
+  const BETA_ONLY = ['wellKnownName', 'isHidden'];
+
+  const answer = (path: string) => {
+    for (const property of BETA_ONLY) {
+      if (path.includes(property)) {
+        throw new Error(
+          `Parsing OData Select and Expand failed: Could not find a property named ` +
+            `'${property}' on type 'microsoft.graph.mailFolder'`,
+        );
+      }
+    }
+    const key = Object.keys(routes).find((k) => path.startsWith(k));
+    if (key === undefined) throw new Error(`stub Graph has no fixture for ${path}`);
+    return routes[key];
+  };
+
+  return {
+    account: {} as never,
+    get: async (path: string) => answer(path),
+    getAll: async (path: string) => (answer(path) as { value: unknown[] }).value,
+    post: async (path: string) => answer(path),
+    postNoContent: async () => undefined,
+    patch: async (path: string) => answer(path),
+    del: async () => undefined,
+    getBinary: async () => Buffer.alloc(0),
+    putRange: async () => new Response(null, { status: 201 }),
+  } as never;
+}
+
+/** The six well-known folders, as a $batch response with Archive missing. */
+const BATCH_FOLDERS = {
+  responses: [
+    { id: '0', status: 200, body: { id: 'f-inbox' } },
+    { id: '1', status: 200, body: { id: 'f-sent' } },
+    { id: '2', status: 200, body: { id: 'f-drafts' } },
+    { id: '3', status: 200, body: { id: 'f-deleted' } },
+    { id: '4', status: 200, body: { id: 'f-junk' } },
+    // No Archive folder in this mailbox.
+    { id: '5', status: 404, body: {} },
+  ],
+};
+
+test('listing labels never asks Graph v1.0 for a beta-only property', async () => {
+  const { microsoftMailApi } = await import('./microsoft/mail.js');
+
+  const api = microsoftMailApi(
+    v1OnlyGraph({
+      '/$batch': BATCH_FOLDERS,
+      '/me/mailFolders/f-projekt/childFolders': {
+        value: [{ id: 'f-2026', displayName: '2026', childFolderCount: 0 }],
+      },
+      '/me/mailFolders': {
+        value: [
+          { id: 'f-inbox', displayName: 'Inbox', childFolderCount: 0 },
+          { id: 'f-projekt', displayName: 'Projekt', childFolderCount: 1 },
+        ],
+      },
+      '/me/outlook/masterCategories': { value: [{ displayName: 'Kunder' }] },
+    }),
+    'erik@corp.com',
+  );
+
+  const labels = await api.listLabels();
+  const byId = new Map(labels.map((l) => [l.id, l]));
+
+  // The Gmail vocabulary is offered whether or not the folder exists, so a
+  // caller can always say "archive this" and get a clear answer if it cannot.
+  assert.equal(byId.get('INBOX')?.type, 'system');
+  assert.equal(byId.get('ARCHIVE')?.type, 'system');
+
+  // A nested folder must be reachable, or it cannot be used as a move target.
+  assert.equal(byId.get('f-2026')?.name, '2026');
+  assert.equal(byId.get('Kunder')?.type, 'user');
+
+  // Inbox is already listed as INBOX; offering its raw id too would give a
+  // caller two ways to name one folder.
+  assert.equal(byId.has('f-inbox'), false);
+});
+
+test('a KQL search sifts out Junk and Deleted Items itself', async () => {
+  const { microsoftMailApi } = await import('./microsoft/mail.js');
+
+  // $search cannot be combined with $filter, so this is the one path that still
+  // has to exclude folders after fetching. It over-fetches to compensate.
+  const messages = {
+    value: [
+      { id: 'm1', subject: 'Riktigt', parentFolderId: 'f-inbox', receivedDateTime: '2026-08-18T10:00:00Z', isRead: true },
+      { id: 'm2', subject: 'Skräp', parentFolderId: 'f-junk', receivedDateTime: '2026-08-18T11:00:00Z', isRead: true },
+      { id: 'm3', subject: 'Raderat', parentFolderId: 'f-deleted', receivedDateTime: '2026-08-18T12:00:00Z', isRead: true },
+    ],
+  };
+
+  const api = microsoftMailApi(
+    v1OnlyGraph({ '/$batch': BATCH_FOLDERS, '/me/messages': messages }),
+    'erik@corp.com',
+  );
+
+  const clean = await api.searchMessages('faktura', 10, false);
+  assert.deepEqual(clean.map((m) => m.subject), ['Riktigt']);
+
+  const everything = await api.searchMessages('faktura', 10, true);
+  assert.deepEqual(
+    everything.map((m) => m.subject),
+    ['Raderat', 'Skräp', 'Riktigt'],
+    'includeSpamTrash must keep them, newest first',
+  );
+});
+
+test('a message carries the Gmail-style labels for where it is and how it is marked', async () => {
+  const { microsoftMailApi } = await import('./microsoft/mail.js');
+
+  const api = microsoftMailApi(
+    v1OnlyGraph({
+      '/$batch': BATCH_FOLDERS,
+      '/me/messages': {
+        value: [
+          {
+            id: 'm1',
+            subject: 'Hej',
+            parentFolderId: 'f-inbox',
+            receivedDateTime: '2026-08-18T10:00:00Z',
+            isRead: false,
+            flag: { flagStatus: 'flagged' },
+            categories: ['Kunder'],
+          },
+        ],
+      },
+    }),
+    'erik@corp.com',
+  );
+
+  const [message] = await api.searchMessages('', 10, false);
+  assert.deepEqual(message!.labelIds, ['INBOX', 'UNREAD', 'STARRED', 'Kunder']);
+  assert.equal(message!.isUnread, true);
+});
+
+test('a filtered search always leads with the property it sorts by', async () => {
+  const { translateQuery } = await import('./microsoft/query.js');
+
+  // Exchange rejects $orderby=receivedDateTime unless the filter starts with
+  // receivedDateTime — verified against a live mailbox, where "is:starred" and
+  // "is:unread has:attachment" both failed with "The restriction or sort order
+  // is too complex for this operation" until the prefix was added.
+  for (const query of ['is:unread has:attachment', 'is:starred', 'has:attachment', 'newer_than:7d']) {
+    const t = translateQuery(query);
+    assert.equal(t.mode, 'filter', `${query} should not need full-text search`);
+    assert.ok(
+      t.odataFilter!.startsWith('receivedDateTime ge '),
+      `${query} produced a filter Exchange would refuse to sort: ${t.odataFilter}`,
+    );
+  }
+
+  // An empty query filters on nothing at all, and $orderby alone is accepted;
+  // adding a prefix there would be a pointless clause on every listing.
+  assert.equal(translateQuery('').odataFilter, null);
+});
+
+test('an over-wide calendar range is refused with the limit named', async () => {
+  const { microsoftCalendarApi } = await import('./microsoft/calendar.js');
+
+  const api = microsoftCalendarApi(stubGraph({ '/me/calendar/calendarView': { value: [] } }), 'me@corp.com');
+
+  // Graph's own words are "The range between the start and end dates is greater
+  // than the allowed range", which reads like a quota rather than an input to fix.
+  await assert.rejects(
+    () =>
+      api.listEvents({
+        calendarId: 'primary',
+        timeMin: '2020-01-01T00:00:00Z',
+        timeMax: '2030-01-01T00:00:00Z',
+        maxResults: 10,
+      }),
+    /1825 days .*five years.*Narrow the range/s,
+  );
+
+  // Just inside the limit still goes through to Graph.
+  await assert.doesNotReject(() =>
+    api.listEvents({
+      calendarId: 'primary',
+      timeMin: '2026-01-01T00:00:00Z',
+      timeMax: '2030-12-01T00:00:00Z',
+      maxResults: 10,
+    }),
+  );
+});
+
+test('a write response in a named zone is converted, not stamped with Z', async () => {
+  const { toEventSummary } = await import('./microsoft/calendar.js');
+
+  // Reads ask for UTC and get it. A create or patch response comes back in the
+  // zone it was submitted in, ignoring the Prefer header — verified live, where
+  // a 09:00 Stockholm meeting was reported as 09:00Z, two hours out.
+  const written = toEventSummary(
+    {
+      id: 'e',
+      start: { dateTime: '2026-08-19T09:00:00.0000000', timeZone: 'Europe/Stockholm' },
+      end: { dateTime: '2026-08-19T09:15:00.0000000', timeZone: 'Europe/Stockholm' },
+    },
+    'me@corp.com',
+  );
+  assert.equal(written.start, '2026-08-19T07:00:00.000Z');
+  assert.equal(written.end, '2026-08-19T07:15:00.000Z');
+
+  // Winter, when Stockholm is one hour ahead rather than two.
+  const winter = toEventSummary(
+    { id: 'e', start: { dateTime: '2026-01-15T09:00:00.0000000', timeZone: 'Europe/Stockholm' } },
+    'me@corp.com',
+  );
+  assert.equal(winter.start, '2026-01-15T08:00:00.000Z');
+
+  // The Windows names some tenants still report.
+  const windows = toEventSummary(
+    { id: 'e', start: { dateTime: '2026-08-19T09:00:00.0000000', timeZone: 'W. Europe Standard Time' } },
+    'me@corp.com',
+  );
+  assert.equal(windows.start, '2026-08-19T07:00:00.000Z');
+
+  // Already UTC, and the ordinary read path, must be untouched.
+  const read = toEventSummary(
+    { id: 'e', start: { dateTime: '2026-08-19T07:00:00.0000000', timeZone: 'UTC' } },
+    'me@corp.com',
+  );
+  assert.equal(read.start, '2026-08-19T07:00:00.000Z');
+
+  // An unrecognised zone cannot be converted; falling back to the wall clock is
+  // no worse than before and never throws.
+  const unknown = toEventSummary(
+    { id: 'e', start: { dateTime: '2026-08-19T09:00:00.0000000', timeZone: 'Mars/Olympus' } },
+    'me@corp.com',
+  );
+  assert.equal(unknown.start, '2026-08-19T09:00:00.000Z');
+});
+
+/* ------------------------------------------------------------------ *
+ * Teams chat: starting one
+ * ------------------------------------------------------------------ */
+
+test('starting a chat adds you and refuses the shapes Teams rejects', async () => {
+  const { microsoftChatApi } = await import('./microsoft/chat.js');
+
+  const posted: unknown[] = [];
+  const graph = {
+    account: {} as never,
+    get: async () => ({
+      id: 'new-chat',
+      chatType: 'oneOnOne',
+      members: [
+        { '@odata.type': AAD, displayName: 'Erik', email: 'erik@corp.com', tenantId: 'T1' },
+        { '@odata.type': AAD, displayName: 'Jon', email: 'jon@corp.com', tenantId: 'T1' },
+      ],
+    }),
+    getAll: async () => [],
+    post: async (_path: string, body: unknown) => {
+      posted.push(body);
+      return { id: 'new-chat' };
+    },
+    postNoContent: async () => undefined,
+    patch: async () => ({}),
+    del: async () => undefined,
+    getBinary: async () => Buffer.alloc(0),
+    putRange: async () => new Response(null, { status: 201 }),
+  } as never;
+
+  const api = microsoftChatApi(graph, 'erik@corp.com');
+
+  const { chat } = await api.createChat(['jon@corp.com']);
+  assert.equal(chat.id, 'new-chat');
+
+  const body = posted[0] as { chatType: string; members: Array<Record<string, string>> };
+  assert.equal(body.chatType, 'oneOnOne');
+  // A chat the account is not a member of is one it could never read again.
+  assert.equal(body.members.length, 2);
+  assert.ok(body.members.some((m) => m['user@odata.bind']?.includes('erik@corp.com')));
+
+  // Listing yourself must not add you twice, which Graph rejects outright.
+  posted.length = 0;
+  await api.createChat(['jon@corp.com', 'ERIK@corp.com', 'jon@corp.com']);
+  assert.equal((posted[0] as { members: unknown[] }).members.length, 2);
+
+  await assert.rejects(() => api.createChat([]), /at least one other person/);
+  await assert.rejects(() => api.createChat(['a@x.com'], 'Projekt'), /cannot be given a topic/);
+});
+
+test('several participants make a named group chat', async () => {
+  const { microsoftChatApi } = await import('./microsoft/chat.js');
+
+  const posted: unknown[] = [];
+  const graph = {
+    account: {} as never,
+    get: async () => ({ id: 'g', chatType: 'group', topic: 'Projekt', members: [] }),
+    getAll: async () => [],
+    post: async (_path: string, body: unknown) => {
+      posted.push(body);
+      return { id: 'g' };
+    },
+    postNoContent: async () => undefined,
+    patch: async () => ({}),
+    del: async () => undefined,
+    getBinary: async () => Buffer.alloc(0),
+    putRange: async () => new Response(null, { status: 201 }),
+  } as never;
+
+  const api = microsoftChatApi(graph, 'erik@corp.com');
+  const { chat, alreadyExisted } = await api.createChat(['a@x.com', 'b@x.com'], 'Projekt');
+
+  const body = posted[0] as { chatType: string; topic: string; members: unknown[] };
+  assert.equal(body.chatType, 'group');
+  assert.equal(body.topic, 'Projekt');
+  assert.equal(body.members.length, 3);
+  assert.equal(chat.topic, 'Projekt');
+  // Group chats are never deduplicated by Teams, so this can only ever be false.
+  assert.equal(alreadyExisted, false);
+});
+
+test('Chat.Create is requested, and chat still only needs Chat.ReadWrite to be usable', async () => {
+  const { GRAPH_SCOPES, GRAPH_SCOPE_FOR } = await import('./config.js');
+  const { hasCapability } = await import('./oauth/capabilities.js');
+
+  assert.ok((GRAPH_SCOPES as readonly string[]).includes('Chat.Create'));
+
+  // Chat.ReadWrite authorises POST /chats on its own, so an account connected
+  // before Chat.Create was requested must not be told it has lost the chat
+  // capability.
+  assert.equal(GRAPH_SCOPE_FOR.chat, 'Chat.ReadWrite');
+  assert.equal(
+    hasCapability(microsoftAccount('https://graph.microsoft.com/Chat.ReadWrite'), 'chat'),
+    true,
+  );
+});
+
+test('excluded folders are filtered by the server, not out of the results', async () => {
+  const { excludeFolders, translateQuery } = await import('./microsoft/query.js');
+
+  // Dropping them after $top=N lets deleted mail eat the result slots: verified
+  // live, where a one-result search returned nothing because the newest message
+  // in the mailbox happened to sit in the bin.
+  const empty = excludeFolders(translateQuery('').odataFilter, ['f-junk', 'f-trash']);
+  assert.equal(
+    empty,
+    "receivedDateTime ge 1970-01-01T00:00:00Z and parentFolderId ne 'f-junk' " +
+      "and parentFolderId ne 'f-trash'",
+  );
+
+  // The sort property has to stay at the front whatever else is added.
+  const withTerms = excludeFolders(translateQuery('is:unread').odataFilter, ['f-junk']);
+  assert.ok(withTerms!.startsWith('receivedDateTime ge '));
+  assert.match(withTerms!, /parentFolderId ne 'f-junk'/);
+  assert.match(withTerms!, /isRead eq false/);
+  // The prefix must appear once, not once per layer that added it.
+  assert.equal(withTerms!.split('receivedDateTime ge ').length - 1, 1);
+
+  // Nothing to exclude leaves the filter exactly as translated.
+  assert.equal(excludeFolders(null, []), null);
+  assert.equal(excludeFolders("isRead eq false", []), 'isRead eq false');
+
+  // A quote in a folder id cannot break out of the literal.
+  assert.match(excludeFolders(null, ["a'b"])!, /parentFolderId ne 'a''b'/);
+});
+
+test('a search returns real hits even when the newest mail is in the bin', async () => {
+  const { microsoftMailApi } = await import('./microsoft/mail.js');
+
+  // The stub answers whatever the server was asked for, so a request that
+  // failed to exclude the bin server-side would show up as a binned message.
+  const requested: string[] = [];
+  const graph = {
+    account: {} as never,
+    get: async (path: string) => {
+      if (path.startsWith('/$batch')) return BATCH_FOLDERS;
+      return { value: [] };
+    },
+    getAll: async (path: string) => {
+      requested.push(path);
+      return [{ id: 'm1', subject: 'Kvar i inkorgen', parentFolderId: 'f-inbox', receivedDateTime: '2026-08-18T09:00:00Z' }];
+    },
+    post: async (path: string) => (path === '/$batch' ? BATCH_FOLDERS : {}),
+    postNoContent: async () => undefined,
+    patch: async () => ({}),
+    del: async () => undefined,
+    getBinary: async () => Buffer.alloc(0),
+    putRange: async () => new Response(null, { status: 201 }),
+  } as never;
+
+  const api = microsoftMailApi(graph, 'erik@corp.com');
+  const hits = await api.searchMessages('', 1, false);
+
+  assert.equal(hits.length, 1, 'one result asked for, one real result returned');
+  assert.match(decodeURIComponent(requested[0]!), /parentFolderId ne 'f-junk'/);
+  assert.match(decodeURIComponent(requested[0]!), /parentFolderId ne 'f-deleted'/);
+
+  // includeSpamTrash means no exclusion clause at all.
+  requested.length = 0;
+  await api.searchMessages('', 1, true);
+  assert.doesNotMatch(decodeURIComponent(requested[0]!), /parentFolderId ne/);
 });

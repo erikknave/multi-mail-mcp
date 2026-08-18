@@ -1,5 +1,10 @@
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { ReauthRequiredError, ScopeMissingError } from '../google/oauth.js';
+import {
+  ReauthRequiredError,
+  ScopeMissingError,
+  UnsupportedForProviderError,
+} from '../oauth/errors.js';
+import { providerLabel } from '../providers.js';
 import { apiDisabledMessage, ServiceError } from '../service.js';
 
 /** JSON payload as the tool's text content, pretty-printed for readability. */
@@ -64,9 +69,9 @@ export function fail(message: string): CallToolResult {
  * Wraps a tool body so failures come back as readable, actionable text rather
  * than a transport-level error.
  *
- * A dead Google grant is the case that matters: it becomes an explicit
- * instruction plus a link, which is what lets an agent recover the situation by
- * simply asking the user to click it.
+ * A dead grant is the case that matters: it becomes an explicit instruction
+ * plus a link, which is what lets an agent recover the situation by simply
+ * asking the user to click it.
  */
 export async function guard(fn: () => Promise<CallToolResult>): Promise<CallToolResult> {
   try {
@@ -74,7 +79,8 @@ export async function guard(fn: () => Promise<CallToolResult>): Promise<CallTool
   } catch (err) {
     if (err instanceof ReauthRequiredError) {
       return fail(
-        `ACTION REQUIRED — Google access for ${err.accountEmail} has expired.\n\n` +
+        `ACTION REQUIRED — ${providerLabel(err.provider)} access for ${err.accountEmail} ` +
+          `has expired.\n\n` +
           `Ask the user to open this link, sign in as ${err.accountEmail}, and approve access:\n` +
           `${err.reauthUrl}\n\n` +
           `Once they confirm they are done, retry this tool call. ` +
@@ -89,6 +95,12 @@ export async function guard(fn: () => Promise<CallToolResult>): Promise<CallTool
           `Once they confirm, retry this tool call. Other accounts are unaffected.`,
       );
     }
+    // Not a permission problem and not fixable by re-consenting: the provider
+    // simply has no such feature, so no link is offered.
+    if (err instanceof UnsupportedForProviderError) {
+      return fail(`NOT AVAILABLE — ${err.message}`);
+    }
+
     if (err instanceof ServiceError) {
       return fail(err.message);
     }
@@ -96,8 +108,9 @@ export async function guard(fn: () => Promise<CallToolResult>): Promise<CallTool
     const disabled = apiDisabledMessage(err);
     if (disabled) return fail(`ACTION REQUIRED — ${disabled}`);
 
-    const e = err as { message?: string; errors?: Array<{ message?: string }> };
+    const e = err as { message?: string; name?: string; errors?: Array<{ message?: string }> };
     const detail = e?.errors?.[0]?.message ?? e?.message ?? String(err);
-    return fail(`Google API call failed: ${detail}`);
+    const which = e?.name === 'GraphError' ? 'Microsoft Graph' : 'Google API';
+    return fail(`${which} call failed: ${detail}`);
   }
 }

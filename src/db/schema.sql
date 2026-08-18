@@ -40,13 +40,16 @@ CREATE TABLE IF NOT EXISTS api_keys (
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
 
--- Connected Google mailboxes, one row per address per user.
--- status: 'active' | 'needs_reauth'
+-- Connected mailboxes, one row per address per user.
+-- provider: 'google' | 'microsoft'  -- which service hosts this mailbox
+-- status:   'active' | 'needs_reauth'
 CREATE TABLE IF NOT EXISTS accounts (
   id                    TEXT PRIMARY KEY,
   user_id               TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   email                 TEXT NOT NULL,
-  google_sub            TEXT,
+  provider              TEXT NOT NULL DEFAULT 'google',
+  -- The provider's stable id for the account: Google's `sub`, Microsoft's `oid`.
+  provider_sub          TEXT,
   display_name          TEXT,
   refresh_token_enc     TEXT,
   access_token_enc      TEXT,

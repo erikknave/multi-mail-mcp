@@ -1,5 +1,6 @@
 import { db, now } from './index.js';
 import { randomId } from '../crypto.js';
+import type { Provider } from '../providers.js';
 
 /* ------------------------------------------------------------------ *
  * Types
@@ -37,7 +38,9 @@ export interface Account {
   id: string;
   user_id: string;
   email: string;
-  google_sub: string | null;
+  provider: Provider;
+  /** The provider's stable account id: Google's `sub`, Microsoft's `oid`. */
+  provider_sub: string | null;
   display_name: string | null;
   refresh_token_enc: string | null;
   access_token_enc: string | null;
@@ -220,7 +223,8 @@ export const accounts = {
   upsert(params: {
     userId: string;
     email: string;
-    googleSub: string | null;
+    provider: Provider;
+    providerSub: string | null;
     displayName: string | null;
     refreshTokenEnc: string | null;
     accessTokenEnc: string | null;
@@ -234,13 +238,14 @@ export const accounts = {
     if (existing) {
       db.prepare(
         `UPDATE accounts SET
-           google_sub = ?, display_name = ?,
+           provider = ?, provider_sub = ?, display_name = ?,
            refresh_token_enc = COALESCE(?, refresh_token_enc),
            access_token_enc = ?, access_token_expires = ?,
            scopes = ?, status = 'active', last_error = NULL, last_ok_at = ?, updated_at = ?
          WHERE id = ?`,
       ).run(
-        params.googleSub,
+        params.provider,
+        params.providerSub,
         params.displayName,
         params.refreshTokenEnc,
         params.accessTokenEnc,
@@ -256,14 +261,16 @@ export const accounts = {
     const id = randomId();
     db.prepare(
       `INSERT INTO accounts
-         (id, user_id, email, google_sub, display_name, refresh_token_enc, access_token_enc,
-          access_token_expires, scopes, status, last_error, last_ok_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, ?)`,
+         (id, user_id, email, provider, provider_sub, display_name, refresh_token_enc,
+          access_token_enc, access_token_expires, scopes, status, last_error, last_ok_at,
+          created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, ?)`,
     ).run(
       id,
       params.userId,
       email,
-      params.googleSub,
+      params.provider,
+      params.providerSub,
       params.displayName,
       params.refreshTokenEnc,
       params.accessTokenEnc,
@@ -301,6 +308,29 @@ export const accounts = {
     return db
       .prepare('SELECT * FROM accounts WHERE email = ? ORDER BY created_at LIMIT 1')
       .get(email.toLowerCase().trim()) as Account | undefined;
+  },
+
+  /**
+   * Stores a rotated refresh token alongside the new access token.
+   *
+   * Microsoft issues a fresh refresh token on every refresh and retires the one
+   * that was used; keeping only the access token would leave the account with a
+   * grant that works until the next renewal and then dies. Google does not
+   * rotate, so its path simply passes null and leaves the stored token alone.
+   */
+  updateTokens(
+    id: string,
+    refreshTokenEnc: string | null,
+    accessTokenEnc: string,
+    expiresAt: number,
+  ): void {
+    db.prepare(
+      `UPDATE accounts SET
+         refresh_token_enc = COALESCE(?, refresh_token_enc),
+         access_token_enc = ?, access_token_expires = ?,
+         status = 'active', last_error = NULL, last_ok_at = ?, updated_at = ?
+       WHERE id = ?`,
+    ).run(refreshTokenEnc, accessTokenEnc, expiresAt, now(), now(), id);
   },
 
   updateAccessToken(id: string, accessTokenEnc: string, expiresAt: number): void {

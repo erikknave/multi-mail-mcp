@@ -3,8 +3,9 @@ import { unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import type { calendar_v3, docs_v1, drive_v3, gmail_v1, sheets_v4 } from 'googleapis';
+import type { docs_v1, drive_v3, sheets_v4 } from 'googleapis';
 import { config } from './config.js';
+import { ServiceError } from './serviceError.js';
 import { randomId, signToken, verifyToken } from './crypto.js';
 import { now } from './db/index.js';
 import { accounts, uploads, type Account, type Upload, type User } from './db/repo.js';
@@ -12,22 +13,28 @@ import { calendarFor } from './google/calendar.js';
 import { docsFor } from './google/docs.js';
 import { driveFor } from './google/drive.js';
 import { sheetsFor } from './google/sheets.js';
-import { gmailFor } from './google/gmail.js';
+import { googleMailApi, gmailFor } from './google/gmail.js';
+import { googleCalendarApi } from './google/calendar.js';
+import { graphFor } from './microsoft/graph.js';
+import { microsoftCalendarApi } from './microsoft/calendar.js';
+import { microsoftChatApi } from './microsoft/chat.js';
+import { microsoftMailApi } from './microsoft/mail.js';
+import type { MailApi } from './mail/types.js';
+import type { CalendarApi } from './calendar/types.js';
+import type { ChatApi } from './chat/types.js';
+import { providerSupports } from './oauth/capabilities.js';
+import type { Capability } from './config.js';
+import { providerLabel, type Provider } from './providers.js';
 import {
   buildReauthUrl,
   getAuthorizedClient,
+  hasCapability,
   ReauthRequiredError,
   requireCapability,
   rethrowAsReauthIfNeeded,
 } from './google/oauth.js';
 
-/** A user-facing problem that should be reported verbatim, not as a stack trace. */
-export class ServiceError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'ServiceError';
-  }
-}
+export { ServiceError } from './serviceError.js';
 
 /* ------------------------------------------------------------------ *
  * Account resolution
@@ -50,7 +57,7 @@ export function resolveAccount(user: User, email?: string): Account {
 
   if (all.length === 0) {
     throw new ServiceError(
-      `No Google accounts are connected yet. Open ${config.publicBaseUrl}/ and connect a mailbox first.`,
+      `No mailboxes are connected yet. Open ${config.publicBaseUrl}/ and connect one first.`,
     );
   }
 
@@ -77,7 +84,7 @@ export function resolveAccounts(user: User, emails?: string[]): Account[] {
   const all = accounts.forUser(user.id);
   if (all.length === 0) {
     throw new ServiceError(
-      `No Google accounts are connected yet. Open ${config.publicBaseUrl}/ and connect a mailbox first.`,
+      `No mailboxes are connected yet. Open ${config.publicBaseUrl}/ and connect one first.`,
     );
   }
   if (!emails || emails.length === 0) return all;
@@ -85,14 +92,102 @@ export function resolveAccounts(user: User, emails?: string[]): Account[] {
   return emails.map((email) => resolveAccount(user, email));
 }
 
-export async function gmailClient(account: Account): Promise<gmail_v1.Gmail> {
+/**
+ * The mail interface for an account, whichever service hosts it.
+ *
+ * Tools work through this rather than a provider's own client, so a mailbox
+ * moving from one column of the dashboard to the other changes nothing about
+ * how they are written.
+ */
+export async function mailApi(account: Account): Promise<MailApi> {
   requireCapability(account, 'gmail');
-  return gmailFor(await getAuthorizedClient(account));
+
+  if (account.provider === 'microsoft') {
+    return microsoftMailApi(await graphFor(account), account.email);
+  }
+  return googleMailApi(gmailFor(await getAuthorizedClient(account)), account.email);
 }
 
-export async function calendarClient(account: Account): Promise<calendar_v3.Calendar> {
+/** The calendar interface for an account, whichever service hosts it. */
+export async function calendarApi(account: Account): Promise<CalendarApi> {
   requireCapability(account, 'calendar');
-  return calendarFor(await getAuthorizedClient(account));
+
+  if (account.provider === 'microsoft') {
+    return microsoftCalendarApi(await graphFor(account), account.email);
+  }
+  return googleCalendarApi(calendarFor(await getAuthorizedClient(account)), account.email);
+}
+
+/**
+ * The chat interface for an account.
+ *
+ * Only Microsoft has one. requireCapability is what turns a Google account into
+ * a precise "Teams chat is not available for this address" rather than a call
+ * that fails somewhere further down.
+ */
+export async function chatApi(account: Account): Promise<ChatApi> {
+  requireCapability(account, 'chat');
+  return microsoftChatApi(await graphFor(account), account.email);
+}
+
+/**
+ * Splits the user's mailboxes into the ones that can do something and the ones
+ * that cannot.
+ *
+ * This exists for tools that span every account, where a capability only some
+ * providers have would otherwise produce a wall of identical failures. Naming
+ * accounts explicitly is handled elsewhere and still errors: asking for Teams
+ * chat in a named Gmail account is a mistake worth reporting, while "check my
+ * chats" across a mixed set of mailboxes is not.
+ *
+ * The skipped accounts are returned rather than dropped, so a tool can say what
+ * it did not look at instead of quietly narrowing the question.
+ */
+export function splitByCapability(
+  accounts: Account[],
+  capability: Capability,
+): { capable: Account[]; skipped: Array<{ account: string; provider: Provider; reason: string }> } {
+  const capable: Account[] = [];
+  const skipped: Array<{ account: string; provider: Provider; reason: string }> = [];
+
+  for (const account of accounts) {
+    if (hasCapability(account, capability)) {
+      capable.push(account);
+    } else if (!providerSupports(account.provider, capability)) {
+      skipped.push({
+        account: account.email,
+        provider: account.provider,
+        reason: `${providerLabel(account.provider)} accounts do not have this capability`,
+      });
+    } else {
+      skipped.push({
+        account: account.email,
+        provider: account.provider,
+        reason:
+          'connected before this capability existed — it needs its permission extending ' +
+          `via ${buildReauthUrl(account)}`,
+      });
+    }
+  }
+
+  return { capable, skipped };
+}
+
+/**
+ * Refuses an operation that only one provider offers, by name.
+ *
+ * Used by the Drive, Sheets and Docs tools: a Microsoft mailbox is not a
+ * broken Google one, and saying so plainly stops an agent from sending the user
+ * off to re-authenticate something that would not help.
+ */
+export function requireProvider(account: Account, provider: Provider, what: string): void {
+  if (account.provider !== provider) {
+    throw new ServiceError(
+      `${what} works only with ${providerLabel(provider)} accounts, and ${account.email} is a ` +
+        `${providerLabel(account.provider)} account. Use a connected ${providerLabel(provider)} ` +
+        `mailbox instead.`,
+    );
+  }
 }
 
 export async function driveClient(account: Account): Promise<drive_v3.Drive> {
@@ -158,6 +253,7 @@ export async function withAccount<T>(
 /** Per-account status, including a re-auth link for any mailbox that needs one. */
 export function accountStatus(account: Account): {
   email: string;
+  provider: Provider;
   displayName: string | null;
   status: string;
   lastError: string | null;
@@ -166,6 +262,7 @@ export function accountStatus(account: Account): {
 } {
   return {
     email: account.email,
+    provider: account.provider,
     displayName: account.display_name,
     status: account.status,
     lastError: account.last_error,

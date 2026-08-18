@@ -1,5 +1,24 @@
 import { google, type gmail_v1 } from 'googleapis';
 import type { OAuth2Client } from 'google-auth-library';
+import { htmlToText } from '../html.js';
+import type {
+  AttachmentRef,
+  MailApi,
+  MailLabel,
+  MessageSummary,
+  OutgoingAttachment,
+  OutgoingMessage,
+  ParsedMessage,
+} from '../mail/types.js';
+
+export type {
+  AttachmentRef,
+  MailLabel,
+  MessageSummary,
+  OutgoingAttachment,
+  OutgoingMessage,
+  ParsedMessage,
+};
 
 export function gmailFor(auth: OAuth2Client): gmail_v1.Gmail {
   return google.gmail({ version: 'v1', auth });
@@ -9,34 +28,6 @@ export function gmailFor(auth: OAuth2Client): gmail_v1.Gmail {
  * Payload parsing
  * ------------------------------------------------------------------ */
 
-export interface AttachmentRef {
-  attachmentId: string;
-  filename: string;
-  mimeType: string;
-  sizeBytes: number;
-}
-
-export interface ParsedMessage {
-  id: string;
-  threadId: string;
-  labelIds: string[];
-  snippet: string;
-  /** RFC 2822 Message-ID header, needed to thread replies correctly. */
-  messageIdHeader: string | null;
-  references: string | null;
-  from: string;
-  to: string;
-  cc: string;
-  bcc: string;
-  subject: string;
-  date: string;
-  /** Unix ms, from Gmail's internalDate — reliable for sorting across accounts. */
-  internalDate: number;
-  bodyText: string;
-  bodyIsHtmlFallback: boolean;
-  attachments: AttachmentRef[];
-}
-
 function header(payload: gmail_v1.Schema$MessagePart | undefined, name: string): string {
   const h = payload?.headers?.find((x) => x.name?.toLowerCase() === name.toLowerCase());
   return h?.value ?? '';
@@ -45,27 +36,6 @@ function header(payload: gmail_v1.Schema$MessagePart | undefined, name: string):
 function decodeBody(data: string | null | undefined): string {
   if (!data) return '';
   return Buffer.from(data, 'base64url').toString('utf8');
-}
-
-/** Crude but adequate HTML-to-text, used only when there is no text/plain part. */
-function htmlToText(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    // Block-level closes become blank lines so paragraphs stay readable;
-    // list and table rows get a single newline.
-    .replace(/<\/(p|div|h[1-6]|blockquote|section|article)>/gi, '\n\n')
-    .replace(/<\/(tr|li)>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
 }
 
 interface Walked {
@@ -122,28 +92,6 @@ export function parseMessage(msg: gmail_v1.Schema$Message): ParsedMessage {
     bodyIsHtmlFallback: usedHtmlFallback,
     attachments: acc.attachments,
   };
-}
-
-/**
- * The compact shape returned by search — deliberately body-free to save tokens.
- *
- * There is no `hasAttachments` here on purpose. Search fetches messages in
- * Gmail's `metadata` format, which returns headers but not the MIME part tree,
- * so attachment presence cannot be determined without refetching every hit in
- * full. Filter with Gmail's own `has:attachment` query operator instead — it
- * runs server-side and costs nothing.
- */
-export interface MessageSummary {
-  id: string;
-  threadId: string;
-  from: string;
-  to: string;
-  subject: string;
-  date: string;
-  internalDate: number;
-  snippet: string;
-  labelIds: string[];
-  isUnread: boolean;
 }
 
 export function summarize(msg: gmail_v1.Schema$Message): MessageSummary {
@@ -230,9 +178,7 @@ export async function getAttachment(
   return Buffer.from(res.data.data, 'base64url');
 }
 
-export async function listLabels(
-  gmail: gmail_v1.Gmail,
-): Promise<Array<{ id: string; name: string; type: string }>> {
+export async function listLabels(gmail: gmail_v1.Gmail): Promise<MailLabel[]> {
   const res = await gmail.users.labels.list({ userId: 'me' });
   return (res.data.labels ?? []).map((l) => ({
     id: l.id ?? '',
@@ -271,26 +217,6 @@ export async function modifyThread(
 /* ------------------------------------------------------------------ *
  * Outgoing mail (MIME assembly)
  * ------------------------------------------------------------------ */
-
-export interface OutgoingAttachment {
-  filename: string;
-  mimeType: string;
-  content: Buffer;
-}
-
-export interface OutgoingMessage {
-  from: string;
-  to: string[];
-  cc?: string[];
-  bcc?: string[];
-  subject: string;
-  bodyText: string;
-  bodyHtml?: string;
-  attachments?: OutgoingAttachment[];
-  /** Set both when replying so mail clients thread the message correctly. */
-  inReplyTo?: string;
-  references?: string;
-}
 
 /** RFC 2047 encoded-word, so non-ASCII subjects and filenames survive. */
 function encodeHeaderValue(value: string): string {
@@ -400,5 +326,39 @@ export async function getProfile(
     emailAddress: res.data.emailAddress ?? '',
     messagesTotal: res.data.messagesTotal ?? 0,
     threadsTotal: res.data.threadsTotal ?? 0,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Provider adapter
+ * ------------------------------------------------------------------ */
+
+/** Presents a Gmail client through the provider-neutral interface. */
+export function googleMailApi(gmail: gmail_v1.Gmail, accountEmail: string): MailApi {
+  return {
+    provider: 'google',
+    accountEmail,
+    searchMessages: (query, limit, includeSpamTrash) =>
+      searchMessages(gmail, query, limit, includeSpamTrash),
+    // Gmail's own syntax, handed straight to Gmail: nothing is lost in translation.
+    explainQuery: () => [],
+    getMessage: (messageId) => getFullMessage(gmail, messageId),
+    getThread: (threadId) => getThread(gmail, threadId),
+    getAttachment: (messageId, attachmentId) => getAttachment(gmail, messageId, attachmentId),
+    listLabels: () => listLabels(gmail),
+    async modifyMessage(messageId, add, remove) {
+      // Gmail ids survive labelling, so the id the caller passed is still good.
+      return { messageId, labelIds: await modifyMessage(gmail, messageId, add, remove) };
+    },
+    modifyThread: (threadId, add, remove) => modifyThread(gmail, threadId, add, remove),
+    send: (msg, threadId) => sendMessage(gmail, msg, threadId),
+    createDraft: (msg, threadId) => createDraft(gmail, msg, threadId),
+    async getProfile() {
+      const profile = await getProfile(gmail);
+      return {
+        emailAddress: profile.emailAddress,
+        stats: { messagesTotal: profile.messagesTotal, threadsTotal: profile.threadsTotal },
+      };
+    },
   };
 }

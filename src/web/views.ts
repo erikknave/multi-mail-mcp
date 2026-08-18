@@ -57,6 +57,10 @@ h2 { font-size: 16px; margin: 0 0 12px; letter-spacing: -0.01em; }
 }
 .pill.ok { color: var(--ok); }
 .pill.warn { color: var(--warn); }
+.tag {
+  display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+  font-weight: 600; color: var(--muted); border: 1px solid var(--line); vertical-align: 1px;
+}
 a { color: var(--accent); }
 button, .btn {
   font: inherit; font-size: 14px; padding: 8px 14px; border-radius: 8px;
@@ -168,7 +172,7 @@ export function layout(title: string, body: string, user?: User | null): string 
 <header class="top">
   <div>
     <h1><a href="/" style="text-decoration:none;color:inherit">multi-mail-mcp</a></h1>
-    <p class="sub">Gmail and Calendar access for AI agents, across several accounts.</p>
+    <p class="sub">Mail and calendar access for AI agents, across several Google and Microsoft accounts.</p>
   </div>
   ${
     user
@@ -214,9 +218,11 @@ export function dashboardPage(params: {
   keys: ApiKey[];
   newKey?: string;
   mcpUrl: string;
+  /** False when the server has no Entra app registration, hiding the button. */
+  microsoftAvailable: boolean;
   message?: { kind: 'ok' | 'err' | 'warn'; text: string };
 }): string {
-  const { user, accounts, keys, newKey, mcpUrl, message } = params;
+  const { user, accounts, keys, newKey, mcpUrl, microsoftAvailable, message } = params;
 
   const accountRows =
     accounts.length === 0
@@ -226,7 +232,7 @@ export function dashboardPage(params: {
             (a) => `
       <div class="row">
         <div class="grow">
-          <div class="mono">${esc(a.email)}</div>
+          <div class="mono">${esc(a.email)} <span class="tag">${esc(a.provider === 'microsoft' ? 'Microsoft' : 'Google')}</span></div>
           <div class="muted">
             ${a.displayName ? `${esc(a.displayName)} &middot; ` : ''}
             ${a.lastOkAt ? `last verified ${esc(a.lastOkAt.slice(0, 16).replace('T', ' '))} UTC` : 'never verified'}
@@ -308,8 +314,21 @@ export function dashboardPage(params: {
        <div class="row">
          <div class="grow muted">
            Adding a mailbox grants this service read/write access to its mail and calendar.
+           ${
+             microsoftAvailable
+               ? 'Google mailboxes additionally get Drive, Sheets and Docs; those tools are ' +
+                 'not available for Microsoft mailboxes.'
+               : ''
+           }
          </div>
-         <a class="btn primary" href="/accounts/connect">Connect a mailbox</a>
+         <div>
+           <a class="btn primary" href="/accounts/connect">Connect Google</a>
+           ${
+             microsoftAvailable
+               ? '<a class="btn" href="/accounts/connect?provider=microsoft">Connect Microsoft</a>'
+               : ''
+           }
+         </div>
        </div>
      </div>
 

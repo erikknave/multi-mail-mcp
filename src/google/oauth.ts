@@ -1,70 +1,18 @@
 import { google } from 'googleapis';
 import type { OAuth2Client } from 'google-auth-library';
-import { config, GOOGLE_SCOPES, SCOPE_FOR, type Capability } from '../config.js';
+import { config, GOOGLE_SCOPES } from '../config.js';
 import { decrypt, encrypt, signToken, verifyToken } from '../crypto.js';
 import { accounts, audit, type Account } from '../db/repo.js';
 import { now } from '../db/index.js';
+import { ReauthRequiredError } from '../oauth/errors.js';
+import { buildReauthUrl } from '../oauth/links.js';
+
+// Re-exported so callers that only deal with Google keep one import site.
+export { ReauthRequiredError, ScopeMissingError } from '../oauth/errors.js';
+export { buildReauthUrl, parseReauthToken } from '../oauth/links.js';
+export { hasCapability, requireCapability } from '../oauth/capabilities.js';
 
 const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
-
-/**
- * Thrown when an account's Google grant is no longer usable and the human must
- * click through consent again. Carries a ready-to-hand-over URL so an agent can
- * simply show `reauthUrl` to the user instead of failing opaquely.
- */
-export class ReauthRequiredError extends Error {
-  readonly accountEmail: string;
-  readonly reauthUrl: string;
-  readonly reason: string;
-
-  constructor(accountEmail: string, reauthUrl: string, reason: string) {
-    super(
-      `Google access for ${accountEmail} has expired and must be renewed. ` +
-        `Ask the user to open this link and sign in, then retry: ${reauthUrl}`,
-    );
-    this.name = 'ReauthRequiredError';
-    this.accountEmail = accountEmail;
-    this.reauthUrl = reauthUrl;
-    this.reason = reason;
-  }
-}
-
-/**
- * Thrown when the account's grant is alive but predates a capability we now
- * need — for example a mailbox connected before Drive support existed. Google
- * answers those calls with an opaque 403, so we detect the gap up front and
- * tell the user exactly what to do about it.
- */
-export class ScopeMissingError extends Error {
-  readonly accountEmail: string;
-  readonly capability: Capability;
-  readonly reauthUrl: string;
-
-  constructor(accountEmail: string, capability: Capability, reauthUrl: string) {
-    super(
-      `${accountEmail} has not granted ${capability} access. It was connected before this ` +
-        `capability existed, so its permission needs extending. Ask the user to open this ` +
-        `link and approve: ${reauthUrl}`,
-    );
-    this.name = 'ScopeMissingError';
-    this.accountEmail = accountEmail;
-    this.capability = capability;
-    this.reauthUrl = reauthUrl;
-  }
-}
-
-/** Whether the stored grant covers a capability. */
-export function hasCapability(account: Account, capability: Capability): boolean {
-  const granted = (account.scopes ?? '').split(/\s+/).filter(Boolean);
-  return granted.includes(SCOPE_FOR[capability]);
-}
-
-/** @throws ScopeMissingError when the account cannot do this yet. */
-export function requireCapability(account: Account, capability: Capability): void {
-  if (!hasCapability(account, capability)) {
-    throw new ScopeMissingError(account.email, capability, buildReauthUrl(account));
-  }
-}
 
 /* ------------------------------------------------------------------ *
  * Clients and URLs
@@ -120,29 +68,6 @@ export function buildConsentUrl(params: {
 
 export function parseOAuthState(state: string): OAuthState | null {
   return verifyToken<OAuthState>(state, 'oauth_state');
-}
-
-/** A shareable link that drops the user straight into consent for one account. */
-export function buildReauthUrl(account: Account): string {
-  const token = signToken({
-    k: 'reauth',
-    exp: now() + config.reauthUrlTtl,
-    uid: account.user_id,
-    aid: account.id,
-    email: account.email,
-  });
-  return `${config.publicBaseUrl}/reauth/${token}`;
-}
-
-export function parseReauthToken(
-  token: string,
-): { uid: string; aid: string; email: string } | null {
-  const payload = verifyToken<{ k: string; exp: number; uid: string; aid: string; email: string }>(
-    token,
-    'reauth',
-  );
-  if (!payload) return null;
-  return { uid: payload.uid, aid: payload.aid, email: payload.email };
 }
 
 /* ------------------------------------------------------------------ *
@@ -361,7 +286,7 @@ export async function getAuthorizedClient(account: Account): Promise<OAuth2Clien
       accountId: account.id,
       detail: result.fatal,
     });
-    throw new ReauthRequiredError(account.email, buildReauthUrl(account), result.fatal);
+    throw new ReauthRequiredError(account.email, 'google', buildReauthUrl(account), result.fatal);
   }
 
   if ('transient' in result) {
@@ -397,6 +322,7 @@ export function rethrowAsReauthIfNeeded(err: unknown, account: Account): never {
   if (/insufficient (authentication )?scopes?|insufficientPermissions|request had insufficient/i.test(message)) {
     throw new ReauthRequiredError(
       account.email,
+      'google',
       buildReauthUrl(account),
       `${message} — the account needs to grant the newer permissions.`,
     );
@@ -415,7 +341,7 @@ export function rethrowAsReauthIfNeeded(err: unknown, account: Account): never {
       accountId: account.id,
       detail: message,
     });
-    throw new ReauthRequiredError(account.email, buildReauthUrl(account), message);
+    throw new ReauthRequiredError(account.email, 'google', buildReauthUrl(account), message);
   }
 
   throw err;

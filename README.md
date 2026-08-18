@@ -1,9 +1,25 @@
 # multi-mail-mcp
 
-An MCP server that gives an AI agent access to **several Gmail / Google Workspace
-accounts at once** — searching and reading mail, reading and updating calendars,
-reading and writing Google Drive, editing Sheets and Docs in place, and moving
-attachments in and out.
+An MCP server that gives an AI agent access to **several mailboxes at once** —
+Gmail / Google Workspace and Microsoft 365 / Outlook side by side. Searching and
+reading mail, reading and updating calendars, reading and writing Google Drive,
+editing Sheets and Docs in place, and moving attachments in and out.
+
+Mail and calendar work identically whichever service a mailbox is on: the same
+Gmail query syntax, the same label names, the same recurrence rules. The rest is
+whatever the provider actually has:
+
+| | Google | Microsoft |
+|---|:---:|:---:|
+| Mail | ● | ● |
+| Calendar | ● | ● |
+| Drive, Sheets, Docs | ● | — |
+| Teams chat | — | ● |
+| Sign-in | ● | — |
+
+Every account reports its own `capabilities` from `list_accounts`, and a tool
+called against a provider that lacks the capability answers `NOT AVAILABLE`
+rather than a permission error — because no consent screen would fix it.
 
 Runs as a single Node process with a SQLite database and a small web UI.
 
@@ -15,17 +31,20 @@ Runs as a single Node process with a SQLite database and a small web UI.
 ┌──────────────────────────────────────────────────────┐
 │ multi-mail-mcp        (one process, port 8456)       │
 │                                                      │
-│   /mcp                    MCP endpoint (bearer key)  │
-│   /                       web UI — mailboxes, keys   │
-│   /oauth/google/callback  Google sign-in + consent   │
-│   /reauth/<token>         one-click access renewal   │
-│   /files/attachment/…     signed attachment download │
-│   /files/upload/…         signed attachment upload   │
-│                                                      │
-│   SQLite: users, mailboxes, keys, staged uploads     │
-└──────────────────────────────────────────────────────┘
-                      │
-                      └──► Gmail API + Calendar API, per mailbox
+│   /mcp                       MCP endpoint (bearer key)     │
+│   /                          web UI — mailboxes, keys      │
+│   /oauth/google/callback     Google sign-in + consent      │
+│   /oauth/microsoft/callback  Microsoft mailbox consent     │
+│   /reauth/<token>            one-click access renewal      │
+│   /files/attachment/…        signed attachment download    │
+│   /files/upload/…            signed attachment upload      │
+│                                                            │
+│   SQLite: users, mailboxes, keys, staged uploads           │
+└────────────────────────────────────────────────────────────┘
+             │                              │
+             ▼                              ▼
+   Gmail / Calendar / Drive         Microsoft Graph
+   (per Google mailbox)             (per Microsoft mailbox)
 ```
 
 Mail is **not** mirrored locally. Every search goes straight to Gmail, so results
@@ -46,7 +65,7 @@ Then open your `PUBLIC_BASE_URL` in a browser and **sign in with Google**.
 
 1. **Sign in.** The account you sign in with is connected as your first mailbox
    automatically — one flow does both.
-2. **Connect the other mailboxes** from the dashboard.
+2. **Connect the other mailboxes** from the dashboard, Google or Microsoft.
 3. **Create an API key.** The dashboard then shows the key once, alongside a
    ready-to-run registration command with the key already filled in, and a copy
    button for each:
@@ -62,8 +81,11 @@ Then open your `PUBLIC_BASE_URL` in a browser and **sign in with Google**.
 
 ### Sign-in rules
 
-There are no passwords. Google is the only way in, and which user you become
-follows three rules, checked in order:
+There are no passwords, and **Google is the only way in** — a Microsoft account
+can be connected as a mailbox but never used to sign in. That keeps one
+authentication path to reason about, and one place where the allowlist applies.
+
+Which user you become follows three rules, checked in order:
 
 1. The address is a known user → sign in as them.
 2. The address is already connected as a **mailbox** on some user → sign in as
@@ -76,10 +98,12 @@ Anything else is refused. The service is on a public URL, so this matters.
 
 ---
 
-## Renewing Google access
+## Renewing access
 
 Google expires refresh tokens after **7 days** while the OAuth app is in
-*Testing* mode, so this will happen often at first. The whole flow is built
+*Testing* mode, so this will happen often at first. Microsoft's refresh tokens
+roll forward as they are used and typically last months, so Microsoft mailboxes
+rarely need this at all. The whole flow is built
 around making it a single click:
 
 - Any tool call that hits a dead grant returns an **`ACTION REQUIRED`** message
@@ -89,8 +113,10 @@ around making it a single click:
   working mailboxes and list the broken ones with their renewal links.
 - `list_accounts` always shows current status, and `get_reauth_url` produces a
   link on demand.
-- Opening the link takes you straight to Google consent for that specific
-  address. No prior sign-in needed; the link itself is the authorisation.
+- Opening the link takes you straight to the right provider's consent screen for
+  that specific address — the link carries an account id, not a provider, so it
+  works the same for both. No prior sign-in needed; the link itself is the
+  authorisation.
 
 Links are HMAC-signed and valid for 24 hours. The callback refuses to proceed if
 you sign in as a different Google account than the one the link was issued for.
@@ -103,7 +129,167 @@ past 100 users.
 
 ---
 
+## Connecting Microsoft mailboxes
+
+Microsoft support is optional and switches itself on once an app registration is
+configured. Without `MICROSOFT_CLIENT_ID` the dashboard simply does not offer it.
+
+In **Azure Portal → Microsoft Entra ID → App registrations → New registration**:
+
+1. **Supported account types** — *Accounts in any organizational directory
+   (multitenant)* to allow any work or school tenant. Use a single tenant id in
+   `MICROSOFT_AUTHORITY` to restrict it to your own, or `common` to also allow
+   personal outlook.com accounts.
+2. **Redirect URI** — type *Web*, exactly
+   `<PUBLIC_BASE_URL>/oauth/microsoft/callback`.
+3. **Certificates & secrets → New client secret** — copy the *Value*, not the
+   Secret ID. It is shown once, and it expires; note the date.
+4. **API permissions → Microsoft Graph → Delegated**: `offline_access`, `openid`,
+   `email`, `profile`, `User.Read`, `Mail.ReadWrite`, `Mail.Send`,
+   `Calendars.ReadWrite`, `Chat.ReadWrite`, `Chat.Create`. Then
+   **Grant admin consent** —
+   depending on the tenant's settings an ordinary user may not be able to
+   consent alone.
+
+`Mail.ReadWrite` is deliberate in the same way `gmail.modify` is: it covers
+reading, moving, flagging and drafting, but not permanent deletion. `Mail.Send`
+is separate so sending is its own explicit grant. `Chat.ReadWrite` authorises
+reading and posting in the chats the user belongs to, and `Chat.Create` starting
+new ones — `ChatMessage.Send` would add nothing, and the *application* chat
+permissions, which are gated and metered by Microsoft, are not used at all.
+
+### What differs from Google
+
+Everything below is handled by the server; this is what is happening underneath.
+
+| Gmail idea | Outlook equivalent |
+|---|---|
+| Labels | Folder, plus read/flagged state and categories |
+| `INBOX` / `SENT` / `DRAFT` / `TRASH` / `SPAM` / `ARCHIVE` | The matching well-known folders |
+| Archive (remove `INBOX`) | Move to Archive |
+| `UNREAD`, `STARRED` | `isRead`, flag status |
+| A user label | A folder move, or a category |
+| Thread id | Conversation id |
+| Query syntax | Translated to KQL or an OData filter |
+| RRULE recurrence | Translated to an Outlook recurrence pattern |
+| Google Meet | Teams meeting |
+
+Five honest limits:
+
+- **`bcc:` cannot be searched.** Outlook does not index it. A query using it
+  comes back with a `queryNotes` entry saying so, rather than quietly returning
+  results that ignored the term.
+- **`sendUpdates` is not honoured.** Outlook always notifies attendees; a
+  calendar write that asked for silence says so in `notes`.
+- **`find_free_time` takes addresses, not calendar ids.** Graph's free/busy is
+  per mailbox — `"primary"` means the account's own address, and any colleague
+  or room address can be added.
+- **Drive, Sheets and Docs are Google-only.** Called against a Microsoft mailbox
+  they answer `NOT AVAILABLE`, which is not a permission problem and cannot be
+  fixed by re-authenticating.
+- **Moving a message changes its id.** Outlook reissues a message under a new
+  id when it changes folder, so `modify_labels` returns the id to use from now
+  on — with `previousMessageId` and a note when it moved. Gmail ids are
+  unaffected by labelling and come back unchanged.
+- **`list_events` spans at most five years per call.** Outlook caps an expanded
+  calendar view at 1825 days; Google has none. Asking wider is refused with the
+  limit named, rather than passed through as Graph's "greater than the allowed
+  range", which reads like a quota.
+
+Two notes on ordering, both learned the hard way against a live mailbox:
+
+- When a query needs full-text matching, Graph's `$search` forbids `$orderby`,
+  so the server fetches a wider page and sorts by date itself. Queries built
+  only from filterable terms (`is:unread`, date ranges, `has:attachment`) take
+  the exact, server-ordered path instead.
+- On that filtered path, Exchange rejects `$orderby=receivedDateTime` unless the
+  filter *leads* with `receivedDateTime` — `is:starred` and
+  `is:unread has:attachment` both failed with "The restriction or sort order is
+  too complex for this operation" until an open-ended lower bound was prepended.
+  Dropping `$orderby` instead would have been worse: the server would then be
+  free to return any N matches, quietly turning "the 20 newest unread" into "20
+  unread, in some order".
+
+Three more Graph behaviours worth not rediscovering:
+
+- `mailFolder.wellKnownName` exists in the Graph **beta** endpoint but not in
+  v1.0, and naming an unknown property in `$select` fails the entire request
+  rather than returning null for it. The well-known folders are resolved by
+  name through a single `$batch` instead.
+- **A write response ignores the `Prefer: outlook.timezone` header.** A created
+  or patched event comes back in the zone it was submitted in, while reads come
+  back in UTC as asked. Stamping that wall clock with `Z` reported a 09:00
+  Stockholm meeting as 09:00Z — two hours out, in a value an agent would repeat
+  to a human as fact. Times are now converted from whatever zone the response
+  declares, IANA or the Windows names some tenants still use.
+- **Junk and Deleted Items are excluded in the query, not from the results.**
+  Graph searches every folder by default while Gmail does not, and dropping the
+  unwanted ones after fetching `$top=N` lets deleted mail eat the result slots —
+  a one-result search returned nothing at all when the newest message happened
+  to be in the bin, which reads as "no mail" rather than "the newest is
+  deleted". `parentFolderId ne` does it server-side. The `$search` path cannot
+  combine with `$filter`, so it still sifts afterwards and over-fetches to
+  compensate.
+- **A sent message is not in Sent Items immediately.** A lookup fired the moment
+  `/send` returns finds nothing, so `send_message` retries once and then reports
+  `messageId: null` with a note to find it through `get_thread` — rather than an
+  empty string the caller would pass to `get_message`.
+
+### Teams chat
+
+`list_chats`, `read_chat`, `start_chat` and `send_chat_message` cover the chats
+the connected account itself belongs to — one-to-one, group and meeting chats —
+including **federated** ones where someone from another organisation is writing
+to you.
+
+Creating and sending are separate tools, which is not an accident: a chat with no
+messages in it is invisible to the other people, so `start_chat` notifies nobody
+and only `send_chat_message` is outward-facing. Teams allows one one-to-one chat
+per pair, so asking for one that exists returns the existing conversation with
+its history and says `alreadyExisted` — group chats have no such rule, and
+calling twice really does create two.
+
+Two things it deliberately does not do:
+
+- **Guest chats in another tenant.** If you were invited as a guest and switch
+  organisation in the Teams client, those conversations belong to *that* tenant,
+  and an access token is always for exactly one tenant. Reaching them means
+  connecting that tenant as its own account, with its own consent.
+- **Downloading chat attachments.** Files posted in a chat live in the sender's
+  OneDrive or a SharePoint site, and the server holds no file permissions for
+  Microsoft accounts. Attachments come back as a name and a link to hand to the
+  user.
+
+Everyone in a chat is checked against the connected account's own tenant, and
+anyone outside it is flagged — as is anyone whose tenant cannot be determined,
+plus bots and anonymous meeting participants. The flag errs towards "external"
+on purpose: mistaking a colleague for an outsider costs one extra question,
+while mistaking an outsider for a colleague means replying to them without
+asking at all. `read_chat` names who triggered the flag so it can be checked
+rather than taken on trust.
+
+Sending is immediate and has no draft state and no unsend, which the tool
+description says plainly so an agent confirms the wording first.
+
+---
+
 ## Tools
+
+Mail, calendar and account tools work with both providers. Drive, Sheets and Docs
+are Google-only; Teams chat is Microsoft-only.
+
+**Only the tools your mailboxes can use are registered.** A tool that could
+only ever answer "not available for this account" is not worth the context it
+costs to describe, and a shorter list is one a model chooses from more
+accurately. So the Drive, Sheets and Docs tools appear once a Google mailbox is
+connected, the Teams chat tools once a Microsoft one is, and a user with nothing
+connected sees only the three account tools — which is what tells them to
+connect a mailbox. In tokens, the full surface is around 17k; a Microsoft-only
+user sees about 8.7k, and a user with no mailboxes about 0.8k.
+
+The endpoint is stateless, so the list is recomputed on every request and needs
+no cache invalidating. A client that caches `tools/list` may need to reconnect
+before newly connected mailboxes bring their tools into view.
 
 **Accounts** — `list_accounts`, `check_account`, `get_reauth_url`
 
@@ -113,6 +299,9 @@ past 100 users.
 **Calendar** — `list_calendars`, `list_events`, `get_event`, `create_event`,
 `update_event`, `delete_event`, `respond_to_event`, `find_free_time`,
 `find_rooms`
+
+**Teams chat** (Microsoft only) — `list_chats`, `read_chat`, `start_chat`,
+`send_chat_message`
 
 **Drive** — `search_drive`, `read_drive_file`, `list_drive_folder`,
 `get_drive_download_url`, `upload_to_drive`, `write_drive_file`,
@@ -135,9 +324,10 @@ Most tools take an optional `account` argument naming the mailbox. Omit it when
 only one mailbox is connected; with several, the tool asks you to name one rather
 than guessing — sending from the wrong address is not worth being clever about.
 
-`search_messages` uses Gmail query syntax and returns compact summaries **without
-bodies**, so a broad search doesn't flood the context window. Follow up with
-`get_message` or `get_thread` for the text and the attachment list.
+`search_messages` uses Gmail query syntax — against both providers — and returns
+compact summaries **without bodies**, so a broad search doesn't flood the context
+window. Follow up with `get_message` or `get_thread` for the text and the
+attachment list.
 
 Search results deliberately carry no attachment flag: Gmail's `metadata` format
 returns headers but not the MIME part tree, so any such field could only ever be
@@ -262,13 +452,16 @@ All settings live in `.env` (see `.env.example`). The ones that matter:
 | `PORT` | Listen port, e.g. `8456` behind a reverse proxy or tunnel. |
 | `PUBLIC_BASE_URL` | Public origin. Used to build the OAuth redirect and every signed URL. |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OAuth client, type *Web application*. |
+| `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` | Entra ID app registration. Blank disables Microsoft mailboxes. |
+| `MICROSOFT_AUTHORITY` | `organizations` (default), a tenant id, or `common` to allow personal accounts. |
 | `ALLOWED_LOGIN_EMAILS` | Comma-separated addresses allowed to create a user. |
 | `ENCRYPTION_KEY` | 32 random bytes, base64. Encrypts refresh tokens at rest. |
 | `URL_SIGNING_SECRET` | 32 random bytes, base64. Signs download, upload and renewal links. |
 | `MAX_UPLOAD_BYTES` | Attachment size cap, default 25 MB (Gmail's own ceiling). |
 
-The redirect URI registered in Google Cloud Console must match
-`<PUBLIC_BASE_URL>/oauth/google/callback` exactly.
+The redirect URIs must match exactly: `<PUBLIC_BASE_URL>/oauth/google/callback`
+in Google Cloud Console, and `<PUBLIC_BASE_URL>/oauth/microsoft/callback` in
+Entra ID.
 
 **Rotating `ENCRYPTION_KEY` or `URL_SIGNING_SECRET` invalidates existing data**:
 a new encryption key makes every stored refresh token unreadable, so every
@@ -278,8 +471,15 @@ mailbox has to be reconnected.
 
 ## Security notes
 
-- **Google refresh tokens are encrypted at rest** with AES-256-GCM. Access tokens
-  are cached encrypted too and refreshed a minute before expiry.
+- **Refresh tokens are encrypted at rest** with AES-256-GCM, for both providers.
+  Access tokens are cached encrypted too and refreshed ahead of expiry. Microsoft
+  rotates its refresh token on every renewal, and the new one is persisted — the
+  grant would otherwise die at the following renewal.
+- **The two OAuth flows cannot be crossed.** Each callback signs its state with a
+  distinct kind, so an authorization code obtained for one provider cannot be
+  replayed at the other's callback.
+- **Microsoft is not a sign-in method.** Its callback has no path that creates a
+  user; it requires an established session or a signed renewal link.
 - **API keys are stored as SHA-256 hashes.** The plaintext is shown once, at
   creation, and is not recoverable.
 - **Every tool is bound to the authenticated user.** A fresh MCP server is built
@@ -289,9 +489,14 @@ mailbox has to be reconnected.
   as an upload token, and a tampered token fails HMAC verification.
 - **Uploaded filenames never touch the filesystem path.** Files are stored under
   a random name; the display name lives only in the database.
-- **`gmail.modify` is requested, not `gmail.full`** — an agent can archive, label
-  and trash, but cannot permanently delete mail. Drive follows the same line: the
-  server never calls `files.delete`, only trash and restore.
+- **Chat access is delegated, never application-wide.** `Chat.ReadWrite` reaches
+  only the chats the signed-in user is already in — there is no path to reading
+  the organisation's messages, and the gated application permissions that would
+  allow it are not requested.
+- **`gmail.modify` is requested, not `gmail.full`**, and `Mail.ReadWrite` rather
+  than anything wider — an agent can archive, label and trash, but cannot
+  permanently delete mail. Drive follows the same line: the server never calls
+  `files.delete`, only trash and restore.
 - **Capabilities are checked before the call.** An account connected before a
   capability existed is detected from its stored scopes and told to extend its
   permission, rather than failing with an opaque 403 from inside the API.
@@ -312,7 +517,7 @@ A **user** service is enough; no root required:
 ```ini
 # ~/.config/systemd/user/multi-mail-mcp.service
 [Unit]
-Description=multi-mail-mcp — Gmail/Calendar MCP server
+Description=multi-mail-mcp — mail and calendar MCP server
 After=network-online.target
 Wants=network-online.target
 
@@ -360,5 +565,17 @@ npm run typecheck  # types only
 ```
 
 Tests cover the parts that are worth testing without live credentials: MIME
-assembly, Gmail payload parsing, calendar mapping, token signing and expiry,
-encryption round-trips, and filename sanitisation.
+assembly, Gmail payload parsing, calendar mapping for both providers, the
+Gmail→Graph query translation, RRULE conversion, capability checks, chat
+participant and message mapping (through a stubbed Graph), HTML entity decoding,
+token signing and expiry, encryption round-trips, and filename sanitisation.
+
+The provider split lives in three places: `src/mail/types.ts`,
+`src/calendar/types.ts` and `src/chat/types.ts` define what a mailbox must be
+able to do, `src/google/*` and `src/microsoft/*` implement it, and
+`src/service.ts` picks between them. Tools never see a provider-specific client.
+
+Which provider offers what is stated once, in `SCOPE_FOR` and `GRAPH_SCOPE_FOR`
+in `src/config.ts`. A `null` there means "this provider has no such thing", and
+everything downstream — the refusal message, the `capabilities` list, which
+accounts a fan-out tool skips — follows from it.

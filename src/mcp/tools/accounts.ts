@@ -1,10 +1,22 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { User } from '../../db/repo.js';
-import { buildReauthUrl, ReauthRequiredError } from '../../google/oauth.js';
-import { getProfile } from '../../google/gmail.js';
-import { accountStatus, gmailClient, listAccounts, resolveAccount } from '../../service.js';
+import { ReauthRequiredError } from '../../oauth/errors.js';
+import { capabilitiesOf } from '../../oauth/capabilities.js';
+import { buildReauthUrl } from '../../oauth/links.js';
+import { accountStatus, listAccounts, mailApi, resolveAccount } from '../../service.js';
 import { guard, ok } from '../reply.js';
+
+/**
+ * What a mailbox can do, in the words the tools use.
+ *
+ * `gmail` is the internal name of the scope; an agent choosing a mailbox is
+ * asking about "mail", and the distinction between Gmail and Outlook is already
+ * carried by `provider`.
+ */
+function friendlyCapabilities(account: Parameters<typeof capabilitiesOf>[0]): string[] {
+  return capabilitiesOf(account).map((capability) => (capability === 'gmail' ? 'mail' : capability));
+}
 
 export function registerAccountTools(server: McpServer, user: User): void {
   server.registerTool(
@@ -12,10 +24,14 @@ export function registerAccountTools(server: McpServer, user: User): void {
     {
       title: 'List connected mailboxes',
       description:
-        'Lists every Google account connected for the current user. Call this first when you ' +
-        'do not know which mailboxes exist.\n\n' +
+        'Lists every mailbox connected for the current user, Google or Microsoft, with the ' +
+        '`provider` of each. Call this first when you do not know which mailboxes exist.\n\n' +
+        'Each account reports the `capabilities` it actually has, which is what to check ' +
+        'before choosing one: mail and calendar work on both providers, drive only on ' +
+        'Google, chat only on Microsoft. A capability missing from the list cannot be used ' +
+        'with that mailbox at all.\n\n' +
         'By default `status` is the LAST KNOWN state, recorded at the previous real call — ' +
-        'an account can read "active" and still fail, because a Google grant can be revoked ' +
+        'an account can read "active" and still fail, because a grant can be revoked ' +
         'at any moment without telling us. Pass verify:true to make a real call per mailbox ' +
         'and get the true current state. Do that before relying on the answer for anything ' +
         'that matters, such as reporting that a mailbox contains nothing.\n\n' +
@@ -53,22 +69,25 @@ export function registerAccountTools(server: McpServer, user: User): void {
               'These statuses are cached from the last real call, not checked just now. ' +
               'A mailbox shown as "active" may still fail. Call again with verify:true for ' +
               'the authoritative state.',
-            accounts: all.map(accountStatus),
+            accounts: all.map((a) => ({
+              ...accountStatus(a),
+              capabilities: friendlyCapabilities(a),
+            })),
           });
         }
 
         const verified = await Promise.all(
           all.map(async (acc) => {
-            const base = accountStatus(acc);
+            const base = { ...accountStatus(acc), capabilities: friendlyCapabilities(acc) };
             try {
-              const gmail = await gmailClient(acc);
-              const profile = await getProfile(gmail);
+              const api = await mailApi(acc);
+              const profile = await api.getProfile();
               return {
                 ...base,
                 status: 'active',
                 verified: true,
                 usable: true,
-                messagesTotal: profile.messagesTotal,
+                stats: profile.stats,
               };
             } catch (err) {
               if (err instanceof ReauthRequiredError) {
@@ -116,7 +135,7 @@ export function registerAccountTools(server: McpServer, user: User): void {
     {
       title: 'Get a re-authentication link',
       description:
-        'Produces a link the user can open to renew Google access for a mailbox. ' +
+        'Produces a link the user can open to renew access for a mailbox, Google or Microsoft. ' +
         'Use this when a mailbox is reported as needing re-authentication, or proactively ' +
         'if calls against it are failing. The link is valid for 24 hours.',
       inputSchema: {
@@ -146,7 +165,7 @@ export function registerAccountTools(server: McpServer, user: User): void {
     {
       title: 'Verify a mailbox works',
       description:
-        'Makes a real call to Gmail to confirm the stored credentials still work. ' +
+        'Makes a real call to the mailbox to confirm the stored credentials still work. ' +
         'Useful before starting a long sequence of operations, or to confirm a user ' +
         'has finished re-authenticating.',
       inputSchema: {
@@ -160,14 +179,15 @@ export function registerAccountTools(server: McpServer, user: User): void {
     async ({ account }) =>
       guard(async () => {
         const acc = resolveAccount(user, account);
-        const gmail = await gmailClient(acc);
-        const profile = await getProfile(gmail);
+        const api = await mailApi(acc);
+        const profile = await api.getProfile();
         return ok({
           account: acc.email,
+          provider: acc.provider,
+          capabilities: friendlyCapabilities(acc),
           working: true,
-          gmailAddress: profile.emailAddress,
-          messagesTotal: profile.messagesTotal,
-          threadsTotal: profile.threadsTotal,
+          mailboxAddress: profile.emailAddress,
+          stats: profile.stats,
         });
       }),
   );

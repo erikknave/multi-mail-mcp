@@ -4,6 +4,9 @@ import { generateApiKey } from '../crypto.js';
 import { allowedLogins, apiKeys, accounts, audit, users } from '../db/repo.js';
 import { currentUser, endSession } from '../auth.js';
 import { buildConsentUrl } from '../google/oauth.js';
+import { consentUrlFor } from '../oauth/consent.js';
+import { microsoftEnabled } from '../microsoft/oauth.js';
+import { isProvider } from '../providers.js';
 import { accountStatus, listAccounts } from '../service.js';
 import { adminPage, dashboardPage, landingPage, messagePage } from './views.js';
 
@@ -33,6 +36,7 @@ webRoutes.get('/', (c) => {
       keys: apiKeys.forUser(user.id),
       newKey: c.req.query('key') ?? undefined,
       mcpUrl: `${config.publicBaseUrl}/mcp`,
+      microsoftAvailable: microsoftEnabled(),
       message,
     }),
   );
@@ -62,7 +66,15 @@ webRoutes.get('/logout', (c) => {
 webRoutes.get('/accounts/connect', (c) => {
   const user = currentUser(c);
   if (!user) return c.redirect('/');
-  return c.redirect(buildConsentUrl({ userId: user.id, returnTo: '/' }));
+
+  // Google stays the default so the original link keeps working unchanged.
+  const requested = c.req.query('provider') ?? 'google';
+  if (!isProvider(requested)) return c.redirect('/?error=Unknown+provider');
+  if (requested === 'microsoft' && !microsoftEnabled()) {
+    return c.redirect('/?error=Microsoft+accounts+are+not+configured+on+this+server');
+  }
+
+  return c.redirect(consentUrlFor(requested, { userId: user.id, returnTo: '/' }));
 });
 
 webRoutes.get('/accounts/reauth', (c) => {
@@ -75,7 +87,13 @@ webRoutes.get('/accounts/reauth', (c) => {
   const account = accounts.byUserAndEmail(user.id, email);
   if (!account) return c.redirect('/?error=Unknown+mailbox');
 
-  return c.redirect(buildConsentUrl({ userId: user.id, expectEmail: account.email, returnTo: '/' }));
+  return c.redirect(
+    consentUrlFor(account.provider, {
+      userId: user.id,
+      expectEmail: account.email,
+      returnTo: '/',
+    }),
+  );
 });
 
 webRoutes.post('/accounts/disconnect', async (c) => {
