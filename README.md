@@ -151,6 +151,14 @@ In **Azure Portal → Microsoft Entra ID → App registrations → New registrat
    depending on the tenant's settings an ordinary user may not be able to
    consent alone.
 
+**Re-grant admin consent whenever the permission list changes.** The grant
+covers the exact set of permissions it was clicked for, so adding one to the app
+registration without pressing *Grant admin consent* again leaves it unconsented.
+Admins do not notice — they can approve for themselves at sign-in — but every
+non-admin user is stopped by "Need admin approval" and cannot connect their
+mailbox at all. One click on that button fixes it for the whole tenant, and
+users then see no consent screen whatsoever.
+
 `Mail.ReadWrite` is deliberate in the same way `gmail.modify` is: it covers
 reading, moving, flagging and drafting, but not permanent deletion. `Mail.Send`
 is separate so sending is its own explicit grant. `Chat.ReadWrite` authorises

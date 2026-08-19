@@ -72,6 +72,14 @@ Adding a capability means: the two scope maps, a label in `providers.ts`, the
 interface, both implementations (or a `null`), a `service.ts` accessor, and a
 registration branch in `mcp/server.ts`.
 
+**Adding a Microsoft scope has a cost outside the code.** A new entry in
+`GRAPH_SCOPES` must also be added to the Entra app registration *and* have
+*Grant admin consent* pressed again. Until that happens, admins can still
+consent for themselves at sign-in and see nothing wrong, while every non-admin
+user is blocked with "Need admin approval". So the failure appears only for
+other people, after the change looks like it worked. Say so when proposing a new
+scope, and prefer an existing one that already covers the call.
+
 ## Tool descriptions are the interface
 
 They are what the model reads at the moment it decides. They are also the whole
