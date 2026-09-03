@@ -1287,10 +1287,11 @@ test('chat against a Google mailbox is unsupported, and names Teams rather than 
     (err: unknown) => {
       assert.ok(err instanceof UnsupportedForProviderError);
       // A ScopeMissingError would hand the user a renewal link, and no amount of
-      // Google consent will ever put Teams chat behind these tools.
+      // Google consent will ever put chat behind these tools.
       assert.ok(!(err instanceof ScopeMissingError));
       assert.match((err as Error).message, /Teams chat/);
-      assert.match((err as Error).message, /Microsoft mailbox/);
+      // The alternative names no single provider now that two offer chat.
+      assert.match((err as Error).message, /supports chat instead/);
       return true;
     },
   );
@@ -1932,4 +1933,401 @@ test('a search returns real hits even when the newest mail is in the bin', async
   requested.length = 0;
   await api.searchMessages('', 1, true);
   assert.doesNotMatch(decodeURIComponent(requested[0]!), /parentFolderId ne/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Slack: capabilities and scope set
+ * ------------------------------------------------------------------ */
+
+const slackAccount = (scopes: string) => ({
+  id: 's', user_id: 'u', email: 'erik@corp.com', provider: 'slack' as const,
+  provider_sub: 'T0/U1', display_name: null, refresh_token_enc: 'enc',
+  access_token_enc: null, access_token_expires: null, status: 'active' as const,
+  last_error: null, last_ok_at: null, created_at: 0, updated_at: 0, scopes,
+});
+
+const ALL_SLACK_SCOPES = [
+  'channels:read', 'groups:read', 'im:read', 'mpim:read',
+  'channels:history', 'groups:history', 'im:history', 'mpim:history',
+  'chat:write', 'im:write', 'mpim:write', 'users:read', 'users:read.email',
+].join(' ');
+
+test('a Slack account is chat-only, and mail against it is unsupported rather than unpermitted', async () => {
+  const { requireCapability, capabilitiesOf, scopeFor } = await import('./oauth/capabilities.js');
+  const { capabilityLabel } = await import('./providers.js');
+  const { ScopeMissingError, UnsupportedForProviderError } = await import('./oauth/errors.js');
+
+  assert.equal(scopeFor('slack', 'gmail'), null);
+  assert.equal(scopeFor('slack', 'calendar'), null);
+  assert.equal(scopeFor('slack', 'drive'), null);
+  assert.equal(capabilityLabel('slack', 'chat'), 'Slack');
+
+  assert.throws(
+    () => requireCapability(slackAccount(ALL_SLACK_SCOPES), 'gmail'),
+    (err: unknown) => {
+      assert.ok(err instanceof UnsupportedForProviderError);
+      assert.ok(!(err instanceof ScopeMissingError));
+      return true;
+    },
+  );
+
+  assert.doesNotThrow(() => requireCapability(slackAccount(ALL_SLACK_SCOPES), 'chat'));
+  assert.deepEqual(capabilitiesOf(slackAccount(ALL_SLACK_SCOPES)), ['chat']);
+});
+
+test('Slack scopes parse from a comma or a space separator', async () => {
+  const { hasCapability } = await import('./oauth/capabilities.js');
+
+  // oauth.v2.access returns authed_user.scope comma-separated; the docs are not
+  // explicit, so both separators have to work.
+  assert.equal(hasCapability(slackAccount('channels:read,chat:write'), 'chat'), true);
+  assert.equal(hasCapability(slackAccount('channels:read,im:read'), 'chat'), false);
+});
+
+test('every capability Slack supports is in the requested scope set', async () => {
+  const { SLACK_SCOPES, SLACK_SCOPE_FOR } = await import('./config.js');
+
+  for (const [capability, scope] of Object.entries(SLACK_SCOPE_FOR)) {
+    if (scope === null) continue;
+    assert.ok(
+      (SLACK_SCOPES as readonly string[]).includes(scope),
+      `consent must request ${scope}, or no account can ever grant ${capability}`,
+    );
+  }
+
+  // The reads are per conversation type — all four must be requested or that
+  // kind of conversation silently vanishes from list_chats.
+  for (const scope of ['channels:history', 'groups:history', 'im:history', 'mpim:history']) {
+    assert.ok((SLACK_SCOPES as readonly string[]).includes(scope), `${scope} must be requested`);
+  }
+  assert.ok((SLACK_SCOPES as readonly string[]).includes('users:read.email'));
+});
+
+test('the Slack endpoints are the real ones, dot-separated method included', async () => {
+  const { SLACK_TOKEN_ENDPOINT, SLACK_API_BASE_URL } = await import('./config.js');
+
+  // Written after a slash in the method name produced a bare 404 from Slack
+  // on the very first real connect: the failure looked like a gateway error.
+  assert.equal(SLACK_TOKEN_ENDPOINT, 'https://slack.com/api/oauth.v2.access');
+  assert.equal(SLACK_API_BASE_URL, 'https://slack.com/api');
+});
+
+test('a Slack account connected without chat:write is skipped with extend-permission wording', async () => {
+  const { splitByCapability } = await import('./service.js');
+
+  const stale = slackAccount('channels:read im:read');
+  const { capable, skipped } = splitByCapability([stale], 'chat');
+
+  assert.equal(capable.length, 0);
+  assert.equal(skipped.length, 1);
+  assert.match(skipped[0]!.reason, /needs its permission extending/);
+});
+
+test('the accounts table keys an address per provider', async () => {
+  const schema = await readFile('src/db/schema.sql', 'utf8');
+  assert.match(schema, /UNIQUE\(user_id, provider, email\)/);
+});
+
+test('sign-in resolution prefers the Google row when a Slack account shares its email', async () => {
+  const { users, accounts } = await import('./db/repo.js');
+
+  const email = `sign-in-${process.pid}@test.example`;
+  const owner = users.create(email, null, false);
+  try {
+    accounts.upsert({
+      userId: owner.id, email, provider: 'slack', providerSub: 'T0/U1',
+      displayName: null, refreshTokenEnc: 'enc', accessTokenEnc: null,
+      accessTokenExpires: null, scopes: ALL_SLACK_SCOPES,
+    });
+    const other = users.create(`mailbox-${process.pid}@test.example`, null, false);
+    try {
+      accounts.upsert({
+        userId: other.id, email, provider: 'google', providerSub: 'g-sub',
+        displayName: null, refreshTokenEnc: 'enc', accessTokenEnc: null,
+        accessTokenExpires: null, scopes: 'gmail',
+      });
+
+      // Sign-in is Google-only, so a Google sign-in must land on the Google row.
+      assert.equal(accounts.byEmailAnyUser(email)!.provider, 'google');
+
+      // And the same address can exist under both providers for one user.
+      accounts.upsert({
+        userId: owner.id, email, provider: 'google', providerSub: 'g-sub',
+        displayName: null, refreshTokenEnc: 'enc', accessTokenEnc: null,
+        accessTokenExpires: null, scopes: 'gmail',
+      });
+      assert.equal(accounts.forUser(owner.id).length, 2);
+
+      // A chat tool naming the shared address must get the Slack row, not the
+      // mailbox that happens to share it — found live, where an agent naming
+      // the account explicitly was answered NOT AVAILABLE.
+      const { resolveAccount } = await import('./service.js');
+      assert.equal(resolveAccount(owner, email, { capability: 'chat' }).provider, 'slack');
+
+      // Without a hint, the first row carrying the address wins — insertion
+      // order, not intent. That ambiguity is exactly what the hint resolves.
+      assert.ok(['google', 'slack'].includes(resolveAccount(owner, email).provider));
+    } finally {
+      users.delete(other.id);
+    }
+  } finally {
+    users.delete(owner.id);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * Slack: mapping, driven through a stubbed Slack web client
+ * ------------------------------------------------------------------ */
+
+/**
+ * A SlackWeb that answers from fixtures, so the mapping can be tested offline.
+ * A route value may be a function of the request params, for methods whose
+ * answer depends on the channel or user asked about.
+ */
+function stubSlackWeb(routes: Record<string, unknown>, calls?: Array<{ method: string; params: unknown }>) {
+  const find = (method: string, params?: unknown) => {
+    const route = routes[method];
+    if (route === undefined) throw new Error(`stub Slack has no fixture for ${method}`);
+    return typeof route === 'function' ? (route as (p: unknown) => unknown)(params) : route;
+  };
+  const record = (method: string, params?: unknown) => calls?.push({ method, params });
+  return {
+    account: {} as never,
+    get: async (method: string, params?: unknown) => {
+      record(method, params);
+      return find(method, params);
+    },
+    getAll: async (method: string, params: unknown, _limit: number, listKey: string) => {
+      record(method, params);
+      const page = find(method, params) as Record<string, unknown[] | undefined>;
+      return page[listKey] ?? [];
+    },
+    post: async (method: string, params: unknown) => {
+      record(method, params);
+      return find(method, params);
+    },
+  } as never;
+}
+
+const SLACK_TS = (seconds: number) => String(seconds);
+
+test('channels map to unnamed-participant chats, ims resolve their counterpart, Slack Connect flags external', async () => {
+  const { slackChatApi } = await import('./slack/chat.js');
+
+  const api = slackChatApi(
+    stubSlackWeb({
+      'conversations.list': {
+        channels: [
+          { id: 'C1', name: 'projekt', is_channel: true, updated: 1755000000 },
+          { id: 'C9', name: 'shared', is_channel: true, is_ext_shared: true, updated: 1754900000 },
+          { id: 'D1', is_im: true, user: 'U2', created: 1755001000 },
+        ],
+      },
+      // The probe fetches one message per conversation to sort by true recency.
+      'conversations.history': (p: { channel: string }) => {
+        const latest: Record<string, { ts: string; text: string }> = {
+          C1: { ts: SLACK_TS(1755000200), text: 'hej\nigen' },
+          C9: { ts: SLACK_TS(1754900100), text: 'shared update' },
+          D1: { ts: SLACK_TS(1755001100), text: 'din tur' },
+        };
+        return { messages: [latest[p.channel]] };
+      },
+      'users.info': (p: { user: string }) =>
+        p.user === 'U2'
+          ? { ok: true, user: { id: 'U2', real_name: 'Anna', profile: { email: 'anna@corp.com' } } }
+          : { ok: false, error: 'users_not_found' },
+    }),
+    'erik@corp.com',
+  );
+
+  const chats = await api.listChats(10);
+
+  assert.deepEqual(chats.map((c) => c.id), ['D1', 'C1', 'C9'], 'sorted by most recent activity');
+
+  const [im, channel, shared] = chats;
+  assert.equal(im!.chatType, 'oneOnOne');
+  assert.equal(im!.topic, null);
+  assert.equal(im!.participants[0]!.displayName, 'Anna');
+  assert.equal(im!.participants[0]!.email, 'anna@corp.com');
+  assert.equal(im!.isExternal, false);
+
+  assert.equal(channel!.chatType, 'channel');
+  assert.equal(channel!.topic, 'projekt');
+  assert.deepEqual(channel!.participants, [], 'a channel is identified by name, not members');
+  assert.equal(channel!.lastMessagePreview, 'hej');
+
+  assert.equal(shared!.isExternal, true, 'a Slack Connect conversation is flagged');
+});
+
+test('messages come back oldest first, with thread replies flattened in after their parent', async () => {
+  const { slackChatApi } = await import('./slack/chat.js');
+
+  const parent = { ts: '200.0001', thread_ts: '200.0001', reply_count: 2, text: 'fråga' };
+  const api = slackChatApi(
+    stubSlackWeb({
+      // Slack returns newest-first.
+      'conversations.history': {
+        messages: [{ ts: '300.0001', text: 'svar i kanalen' }, parent, { ts: '100.0001', text: 'först' }],
+      },
+      'conversations.replies': {
+        messages: [parent, { ts: '201.0001', thread_ts: '200.0001', text: 'svar ett' }, { ts: '202.0001', thread_ts: '200.0001', text: 'svar två' }],
+      },
+    }),
+    'erik@corp.com',
+  );
+
+  const messages = await api.listMessages('C1', 30);
+
+  assert.deepEqual(
+    messages.map((m) => m.bodyText),
+    ['först', 'fråga', 'svar ett', 'svar två', 'svar i kanalen'],
+  );
+
+  const [, parentSummary, replyOne] = messages;
+  assert.equal(parentSummary!.replyCount, 2);
+  assert.equal(parentSummary!.threadTruncated, undefined);
+  assert.equal(replyOne!.inThreadOf, '200.0001');
+  assert.equal(replyOne!.replyCount, undefined);
+});
+
+test('a thread with more replies than the fetch cap says so on the parent', async () => {
+  const { slackChatApi } = await import('./slack/chat.js');
+  const { REPLY_CAP } = { REPLY_CAP: 20 } as const;
+
+  const parent = { ts: '200.0001', thread_ts: '200.0001', reply_count: 50, text: 'fråga' };
+  const capped = Array.from({ length: REPLY_CAP }, (_, i) => ({
+    ts: `${201 + i}.0001`,
+    thread_ts: '200.0001',
+    text: `svar ${i}`,
+  }));
+  const api = slackChatApi(
+    stubSlackWeb({
+      'conversations.history': { messages: [parent] },
+      'conversations.replies': { messages: [parent, ...capped] },
+    }),
+    'erik@corp.com',
+  );
+
+  const messages = await api.listMessages('C1', 10);
+
+  assert.equal(messages.length, REPLY_CAP + 1);
+  assert.equal(messages[0]!.replyCount, 50);
+  assert.equal(messages[0]!.threadTruncated, true, '47 replies exist that were not fetched');
+});
+
+test('subtypes are flagged as system events, file shares are not and carry a permalink', async () => {
+  const { slackChatApi } = await import('./slack/chat.js');
+
+  const api = slackChatApi(
+    stubSlackWeb({
+      'conversations.history': {
+        messages: [
+          { ts: '3.0001', subtype: 'channel_join', text: '<@U1> joined', user: 'U2' },
+          { ts: '2.0001', text: 'dokument', user: 'U2', files: [{ name: 'report.pdf', mimetype: 'application/pdf', permalink: 'https://slack.com/files/p1' }] },
+          { ts: '1.0001', bot_id: 'B1', username: 'Hubot', text: 'jag är en bot' },
+        ],
+      },
+      'users.info': { ok: true, user: { id: 'U2', real_name: 'Anna', profile: {} } },
+    }),
+    'erik@corp.com',
+  );
+
+  // Newest-first from Slack, presented oldest-first.
+  const [bot, share, join] = await api.listMessages('C1', 10);
+
+  assert.equal(join!.isSystemEvent, true);
+  assert.equal(share!.isSystemEvent, false);
+  assert.deepEqual(share!.attachments, [
+    { name: 'report.pdf', contentType: 'application/pdf', url: 'https://slack.com/files/p1' },
+  ]);
+  assert.equal(bot!.from, 'Hubot (app)');
+  assert.equal(bot!.isSystemEvent, false);
+  assert.equal(share!.from, 'Anna', 'senders resolve through users.info');
+});
+
+test('start_chat looks addresses up and opens a conversation without the self', async () => {
+  const { slackChatApi } = await import('./slack/chat.js');
+  const { ServiceError } = await import('./serviceError.js');
+
+  const calls: Array<{ method: string; params: unknown }> = [];
+  const api = slackChatApi(
+    stubSlackWeb(
+      {
+        'users.lookupByEmail': (p: { email: string }) =>
+          p.email === 'anna@corp.com'
+            ? { ok: true, user: { id: 'U2' } }
+            : { ok: false, error: 'users_not_found' },
+        'conversations.open': { ok: true, no_op: true, already_open: true, channel: { id: 'D9', is_im: true, user: 'U2' } },
+        'conversations.history': { messages: [{ ts: '5.0001', text: 'gammalt' }] },
+        'users.info': { ok: true, user: { id: 'U2', real_name: 'Anna', profile: { email: 'anna@corp.com' } } },
+      },
+      calls,
+    ),
+    'erik@corp.com',
+  );
+
+  const { chat, alreadyExisted } = await api.createChat(['erik@corp.com', 'ANNA@corp.com']);
+
+  assert.equal(alreadyExisted, true);
+  assert.equal(chat.id, 'D9');
+  assert.equal(chat.participants[0]!.displayName, 'Anna');
+
+  const open = calls.find((c) => c.method === 'conversations.open')!;
+  assert.deepEqual(open.params, { users: 'U2', return_im: true });
+
+  // A refusal per rule: the things Slack cannot do are said, not dropped.
+  await assert.rejects(() => api.createChat(['anna@corp.com'], 'Ämne'), ServiceError);
+  await assert.rejects(() => api.createChat(['saknas@corp.com']), (err: unknown) => {
+    assert.ok(err instanceof ServiceError);
+    assert.match((err as Error).message, /saknas@corp\.com/);
+    return true;
+  });
+  await assert.rejects(
+    () => api.createChat(['1@x.com', '2@x.com', '3@x.com', '4@x.com', '5@x.com', '6@x.com', '7@x.com', '8@x.com']),
+    /caps a group DM/,
+  );
+});
+
+test('send_chat_message refuses HTML and empty bodies, and posts text as-is', async () => {
+  const { slackChatApi } = await import('./slack/chat.js');
+  const { ServiceError } = await import('./serviceError.js');
+
+  const calls: Array<{ method: string; params: unknown }> = [];
+  const api = slackChatApi(
+    stubSlackWeb(
+      {
+        'chat.postMessage': { ok: true, ts: '1755000000.000400' },
+      },
+      calls,
+    ),
+    'erik@corp.com',
+  );
+
+  await assert.rejects(() => api.sendMessage('C1', { body: '   ' }), ServiceError);
+  // Converting HTML would silently drop link targets — a narrowing of a write.
+  await assert.rejects(() => api.sendMessage('C1', { body: '<b>hej</b>', isHtml: true }), /mrkdwn/);
+
+  const sent = await api.sendMessage('C1', { body: '*viktigt*' });
+  assert.equal(sent.id, '1755000000.000400');
+  assert.equal(sent.createdAt, new Date(1755000000000).toISOString());
+
+  const posted = calls.find((c) => c.method === 'chat.postMessage')!;
+  assert.deepEqual(posted.params, { channel: 'C1', text: '*viktigt*' });
+
+  const threaded = await api.sendMessage('C1', { body: 'i tråden', threadParentId: '200.0001' });
+  assert.ok(threaded.id);
+  assert.deepEqual(
+    calls[calls.length - 1]!.params,
+    { channel: 'C1', text: 'i tråden', thread_ts: '200.0001' },
+  );
+});
+
+test('a Slack failure is reported as a Slack API call, not a Google one', async () => {
+  const { SlackApiError } = await import('./slack/web.js');
+  const { guard } = await import('./mcp/reply.js');
+
+  const result = await guard(async () => {
+    throw new SlackApiError(500, 'internal_error', 'Slack conversations.list failed: internal_error');
+  });
+  assert.match(result.content[0]!.type === 'text' ? result.content[0]!.text : '', /Slack API call failed/);
 });

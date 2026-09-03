@@ -6,6 +6,7 @@ import { currentUser, endSession } from '../auth.js';
 import { buildConsentUrl } from '../google/oauth.js';
 import { consentUrlFor } from '../oauth/consent.js';
 import { microsoftEnabled } from '../microsoft/oauth.js';
+import { slackEnabled } from '../slack/oauth.js';
 import { isProvider } from '../providers.js';
 import { accountStatus, listAccounts } from '../service.js';
 import { adminPage, dashboardPage, landingPage, messagePage } from './views.js';
@@ -37,6 +38,7 @@ webRoutes.get('/', (c) => {
       newKey: c.req.query('key') ?? undefined,
       mcpUrl: `${config.publicBaseUrl}/mcp`,
       microsoftAvailable: microsoftEnabled(),
+      slackAvailable: slackEnabled(),
       message,
     }),
   );
@@ -73,6 +75,9 @@ webRoutes.get('/accounts/connect', (c) => {
   if (requested === 'microsoft' && !microsoftEnabled()) {
     return c.redirect('/?error=Microsoft+accounts+are+not+configured+on+this+server');
   }
+  if (requested === 'slack' && !slackEnabled()) {
+    return c.redirect('/?error=Slack+accounts+are+not+configured+on+this+server');
+  }
 
   return c.redirect(consentUrlFor(requested, { userId: user.id, returnTo: '/' }));
 });
@@ -84,7 +89,12 @@ webRoutes.get('/accounts/reauth', (c) => {
   const email = c.req.query('email');
   if (!email) return c.redirect('/?error=No+mailbox+specified');
 
-  const account = accounts.byUserAndEmail(user.id, email);
+  // The provider disambiguates a Slack account that shares its email with a
+  // mailbox; the dashboard row knows which one the button was clicked on.
+  const provider = c.req.query('provider') ?? '';
+  if (!isProvider(provider)) return c.redirect('/?error=Unknown+provider');
+
+  const account = accounts.byUserAndEmail(user.id, email, provider);
   if (!account) return c.redirect('/?error=Unknown+mailbox');
 
   return c.redirect(
@@ -102,7 +112,10 @@ webRoutes.post('/accounts/disconnect', async (c) => {
 
   const form = await c.req.formData();
   const email = String(form.get('email') ?? '');
-  const account = accounts.byUserAndEmail(user.id, email);
+  const provider = String(form.get('provider') ?? '');
+  if (!isProvider(provider)) return c.redirect('/?error=Unknown+provider');
+
+  const account = accounts.byUserAndEmail(user.id, email, provider);
   if (!account) return c.redirect('/?error=Unknown+mailbox');
 
   accounts.delete(account.id, user.id);

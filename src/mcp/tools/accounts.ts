@@ -4,7 +4,7 @@ import type { User } from '../../db/repo.js';
 import { ReauthRequiredError } from '../../oauth/errors.js';
 import { capabilitiesOf } from '../../oauth/capabilities.js';
 import { buildReauthUrl } from '../../oauth/links.js';
-import { accountStatus, listAccounts, mailApi, resolveAccount } from '../../service.js';
+import { accountStatus, listAccounts, probeAccount, resolveAccount } from '../../service.js';
 import { guard, ok } from '../reply.js';
 
 /**
@@ -24,12 +24,12 @@ export function registerAccountTools(server: McpServer, user: User): void {
     {
       title: 'List connected mailboxes',
       description:
-        'Lists every mailbox connected for the current user, Google or Microsoft, with the ' +
-        '`provider` of each. Call this first when you do not know which mailboxes exist.\n\n' +
+        'Lists every account connected for the current user — Google, Microsoft or Slack — ' +
+        'with the `provider` of each. Call this first when you do not know which accounts exist.\n\n' +
         'Each account reports the `capabilities` it actually has, which is what to check ' +
-        'before choosing one: mail and calendar work on both providers, drive only on ' +
-        'Google, chat only on Microsoft. A capability missing from the list cannot be used ' +
-        'with that mailbox at all.\n\n' +
+        'before choosing one: mail and calendar work on both mailbox providers, drive only ' +
+        'on Google, chat on Microsoft and Slack. A capability missing from the list cannot ' +
+        'be used with that account at all.\n\n' +
         'By default `status` is the LAST KNOWN state, recorded at the previous real call — ' +
         'an account can read "active" and still fail, because a grant can be revoked ' +
         'at any moment without telling us. Pass verify:true to make a real call per mailbox ' +
@@ -80,14 +80,13 @@ export function registerAccountTools(server: McpServer, user: User): void {
           all.map(async (acc) => {
             const base = { ...accountStatus(acc), capabilities: friendlyCapabilities(acc) };
             try {
-              const api = await mailApi(acc);
-              const profile = await api.getProfile();
+              const probe = await probeAccount(acc);
               return {
                 ...base,
                 status: 'active',
                 verified: true,
                 usable: true,
-                stats: profile.stats,
+                ...(probe.stats ? { stats: probe.stats } : {}),
               };
             } catch (err) {
               if (err instanceof ReauthRequiredError) {
@@ -163,9 +162,9 @@ export function registerAccountTools(server: McpServer, user: User): void {
   server.registerTool(
     'check_account',
     {
-      title: 'Verify a mailbox works',
+      title: 'Verify an account works',
       description:
-        'Makes a real call to the mailbox to confirm the stored credentials still work. ' +
+        'Makes a real call to the account to confirm the stored credentials still work. ' +
         'Useful before starting a long sequence of operations, or to confirm a user ' +
         'has finished re-authenticating.',
       inputSchema: {
@@ -179,15 +178,15 @@ export function registerAccountTools(server: McpServer, user: User): void {
     async ({ account }) =>
       guard(async () => {
         const acc = resolveAccount(user, account);
-        const api = await mailApi(acc);
-        const profile = await api.getProfile();
+        const probe = await probeAccount(acc);
         return ok({
           account: acc.email,
           provider: acc.provider,
           capabilities: friendlyCapabilities(acc),
           working: true,
-          mailboxAddress: profile.emailAddress,
-          stats: profile.stats,
+          probed: probe.probed,
+          ...(probe.mailboxAddress ? { mailboxAddress: probe.mailboxAddress } : {}),
+          ...(probe.stats ? { stats: probe.stats } : {}),
         });
       }),
   );

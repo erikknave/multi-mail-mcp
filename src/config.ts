@@ -44,6 +44,10 @@ const publicBaseUrl = required('PUBLIC_BASE_URL').replace(/\/+$/, '');
 const microsoftConfigured =
   !!process.env.MICROSOFT_CLIENT_ID?.trim() && !!process.env.MICROSOFT_CLIENT_SECRET?.trim();
 
+/** Slack support likewise: a Slack app's credentials make the option appear. */
+const slackConfigured =
+  !!process.env.SLACK_CLIENT_ID?.trim() && !!process.env.SLACK_CLIENT_SECRET?.trim();
+
 export const config = {
   port: num('PORT', 8456),
   publicBaseUrl,
@@ -71,6 +75,19 @@ export const config = {
          * allow both.
          */
         authority: (process.env.MICROSOFT_AUTHORITY?.trim() || 'organizations').replace(/\/+$/, ''),
+      }
+    : null,
+  /**
+   * Slack is optional in the same way Microsoft is: without an app configured
+   * the dashboard does not offer it and no Slack code path runs. Unlike the
+   * mailbox providers, a Slack account is chat-only.
+   */
+  slack: slackConfigured
+    ? {
+        clientId: required('SLACK_CLIENT_ID'),
+        clientSecret: required('SLACK_CLIENT_SECRET'),
+        /** Registered in the Slack app's OAuth & Permissions. Must match exactly. */
+        redirectUri: `${publicBaseUrl}/oauth/slack/callback`,
       }
     : null,
   /**
@@ -170,8 +187,63 @@ export const GRAPH_SCOPE_FOR: Record<Capability, string | null> = {
   chat: 'Chat.ReadWrite',
 };
 
+/**
+ * Slack user-token scopes requested per Slack account. These are *user* scopes:
+ * the token (xoxp) acts as the member who authorised it — it reads exactly the
+ * conversations they can read and posts as them, which is the same delegated
+ * stance the Teams chat capability takes. No bot token is requested at all.
+ *
+ * The `*:read` scopes list conversations, `*:history` reads them,
+ * `im:write`/`mpim:write` open DMs and group DMs, and `users:read(.email)`
+ * resolves member names, emails and address→user lookups. Deliberately absent:
+ * `channels:write`/`groups:write` (creating or renaming channels is not
+ * something this server does) and `bots:read`/`files:read` (bot senders resolve
+ * to "(app)" and files are handed over as permalinks, as Teams attachments are).
+ */
+export const SLACK_SCOPES = [
+  'channels:read',
+  'groups:read',
+  'im:read',
+  'mpim:read',
+  'channels:history',
+  'groups:history',
+  'im:history',
+  'mpim:history',
+  'chat:write',
+  'im:write',
+  'mpim:write',
+  'users:read',
+  'users:read.email',
+] as const;
+
+/**
+ * Slack is chat-only: null for everything else, which is what makes mail,
+ * calendar and Drive tools answer "not available for a Slack account" with the
+ * right wording instead of a permission error.
+ *
+ * `chat` keys on `chat:write` — the one scope every working grant must contain.
+ * Slack has no combined read scope (history is four per-conversation-type
+ * scopes), so there is no single read scope whose absence would cleanly
+ * separate a stale grant from a working one.
+ */
+export const SLACK_SCOPE_FOR: Record<Capability, string | null> = {
+  gmail: null,
+  calendar: null,
+  drive: null,
+  chat: 'chat:write',
+};
+
 export const MICROSOFT_TOKEN_ENDPOINT = (authority: string): string =>
   `https://login.microsoftonline.com/${authority}/oauth2/v2.0/token`;
+
+/** The "Add to Slack" authorisation page, and the code-exchange endpoint. */
+export const SLACK_AUTHORIZE_ENDPOINT = 'https://slack.com/oauth/v2/authorize';
+// The method is dot-separated like every Web API method — a slash here is a
+// perfectly plausible typo that Slack answers with a plain 404.
+export const SLACK_TOKEN_ENDPOINT = 'https://slack.com/api/oauth.v2.access';
+
+/** Base URL of the Slack Web API; every method is POST/GET under this. */
+export const SLACK_API_BASE_URL = 'https://slack.com/api';
 
 export const MICROSOFT_AUTHORIZE_ENDPOINT = (authority: string): string =>
   `https://login.microsoftonline.com/${authority}/oauth2/v2.0/authorize`;

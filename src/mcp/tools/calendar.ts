@@ -2,7 +2,13 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { User } from '../../db/repo.js';
 import { ReauthRequiredError } from '../../oauth/errors.js';
-import { calendarApi, resolveAccount, resolveAccounts, ServiceError } from '../../service.js';
+import {
+  calendarApi,
+  resolveAccount,
+  resolveAccounts,
+  resolveFanoutTargets,
+  ServiceError,
+} from '../../service.js';
 import { guard, ok, partial, type AccountProblem } from '../reply.js';
 
 const accountArg = z
@@ -54,7 +60,7 @@ export function registerCalendarTools(server: McpServer, user: User): void {
     },
     async ({ accounts }) =>
       guard(async () => {
-        const targets = resolveAccounts(user, accounts);
+        const { targets, skipped } = resolveFanoutTargets(user, accounts, 'calendar');
         const results = await Promise.all(
           targets.map(async (acc) => {
             try {
@@ -81,7 +87,11 @@ export function registerCalendarTools(server: McpServer, user: User): void {
             ...('reauthUrl' in r && r.reauthUrl ? { reauthUrl: r.reauthUrl as string } : {}),
           }));
 
-        return partial({ accounts: results }, problems, 'calendars');
+        return partial(
+          { ...(skipped.length ? { skippedAccounts: skipped } : {}), accounts: results },
+          problems,
+          'calendars',
+        );
       }),
   );
 
@@ -110,7 +120,7 @@ export function registerCalendarTools(server: McpServer, user: User): void {
     },
     async ({ timeMin, timeMax, accounts, calendarId, query, limit }) =>
       guard(async () => {
-        const targets = resolveAccounts(user, accounts);
+        const { targets, skipped } = resolveFanoutTargets(user, accounts, 'calendar');
 
         const perAccount = await Promise.all(
           targets.map(async (acc) => {
@@ -160,6 +170,7 @@ export function registerCalendarTools(server: McpServer, user: User): void {
           {
             timeMin,
             timeMax,
+            ...(skipped.length ? { skippedAccounts: skipped } : {}),
             calendarsRead: targets.length - problems.length,
             calendarsRequested: targets.length,
             eventCount: merged.length,
@@ -514,7 +525,7 @@ export function registerCalendarTools(server: McpServer, user: User): void {
     },
     async ({ timeMin, timeMax, accounts, calendarIds }) =>
       guard(async () => {
-        const targets = resolveAccounts(user, accounts);
+        const { targets, skipped } = resolveFanoutTargets(user, accounts, 'calendar');
         const ids = calendarIds?.length ? calendarIds : ['primary'];
 
         const results = await Promise.all(
@@ -540,7 +551,13 @@ export function registerCalendarTools(server: McpServer, user: User): void {
           }));
 
         return partial(
-          { timeMin, timeMax, calendars: ids, accounts: results },
+          {
+            timeMin,
+            timeMax,
+            calendars: ids,
+            ...(skipped.length ? { skippedAccounts: skipped } : {}),
+            accounts: results,
+          },
           problems,
           'busy intervals',
         );
@@ -580,7 +597,7 @@ export function registerCalendarTools(server: McpServer, user: User): void {
     },
     async ({ accounts, daysBack, nameContains }) =>
       guard(async () => {
-        const targets = resolveAccounts(user, accounts);
+        const { targets, skipped } = resolveFanoutTargets(user, accounts, 'calendar');
         const needle = nameContains?.toLowerCase();
 
         const results = await Promise.all(
@@ -616,6 +633,7 @@ export function registerCalendarTools(server: McpServer, user: User): void {
         return partial(
           {
             roomCount: total,
+            ...(skipped.length ? { skippedAccounts: skipped } : {}),
             accounts: results,
             howToBook:
               'Add the room\'s email to addAttendees on update_event, or to attendees on ' +

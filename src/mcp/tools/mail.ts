@@ -10,6 +10,7 @@ import {
   mailApi,
   resolveAccount,
   resolveAccounts,
+  resolveFanoutTargets,
   ServiceError,
 } from '../../service.js';
 import { guard, ok, partial, type AccountProblem } from '../reply.js';
@@ -111,7 +112,7 @@ export function registerMailTools(server: McpServer, user: User): void {
     },
     async ({ query, accounts, limit, includeSpamTrash }) =>
       guard(async () => {
-        const targets = resolveAccounts(user, accounts);
+        const { targets, skipped } = resolveFanoutTargets(user, accounts, 'gmail');
 
         const perAccount = await Promise.all(
           targets.map(async (acc) => {
@@ -163,6 +164,7 @@ export function registerMailTools(server: McpServer, user: User): void {
             query,
             ...(queryNotes.length ? { queryNotes } : {}),
             searchedAccounts: targets.map((a) => a.email),
+            ...(skipped.length ? { skippedAccounts: skipped } : {}),
             mailboxesSearched: targets.length - problems.length,
             mailboxesRequested: targets.length,
             totalResults: merged.length,

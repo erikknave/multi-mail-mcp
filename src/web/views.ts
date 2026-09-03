@@ -1,4 +1,5 @@
 import type { AllowedLogin, ApiKey, User } from '../db/repo.js';
+import { providerLabel } from '../providers.js';
 import type { accountStatus } from '../service.js';
 
 type AccountView = ReturnType<typeof accountStatus>;
@@ -220,9 +221,12 @@ export function dashboardPage(params: {
   mcpUrl: string;
   /** False when the server has no Entra app registration, hiding the button. */
   microsoftAvailable: boolean;
+  /** False when the server has no Slack app, hiding the button. */
+  slackAvailable: boolean;
   message?: { kind: 'ok' | 'err' | 'warn'; text: string };
 }): string {
-  const { user, accounts, keys, newKey, mcpUrl, microsoftAvailable, message } = params;
+  const { user, accounts, keys, newKey, mcpUrl, microsoftAvailable, slackAvailable, message } =
+    params;
 
   const accountRows =
     accounts.length === 0
@@ -232,7 +236,7 @@ export function dashboardPage(params: {
             (a) => `
       <div class="row">
         <div class="grow">
-          <div class="mono">${esc(a.email)} <span class="tag">${esc(a.provider === 'microsoft' ? 'Microsoft' : 'Google')}</span></div>
+          <div class="mono">${esc(a.email)} <span class="tag">${esc(providerLabel(a.provider))}</span></div>
           <div class="muted">
             ${a.displayName ? `${esc(a.displayName)} &middot; ` : ''}
             ${a.lastOkAt ? `last verified ${esc(a.lastOkAt.slice(0, 16).replace('T', ' '))} UTC` : 'never verified'}
@@ -250,11 +254,12 @@ export function dashboardPage(params: {
           ${
             a.reauthUrl
               ? `<a class="btn primary" href="${esc(a.reauthUrl)}">Renew access</a>`
-              : `<a class="btn" href="/accounts/reauth?email=${encodeURIComponent(a.email)}">Renew</a>`
+              : `<a class="btn" href="/accounts/reauth?email=${encodeURIComponent(a.email)}&provider=${esc(a.provider)}">Renew</a>`
           }
           <form class="inline" method="post" action="/accounts/disconnect"
-                onsubmit="return confirm('Disconnect ${esc(a.email)}? Agents will lose access to this mailbox.')">
+                onsubmit="return confirm('Disconnect ${esc(a.email)}? Agents will lose access to this account.')">
             <input type="hidden" name="email" value="${esc(a.email)}">
+            <input type="hidden" name="provider" value="${esc(a.provider)}">
             <button class="danger" type="submit">Disconnect</button>
           </form>
         </div>
@@ -309,7 +314,7 @@ export function dashboardPage(params: {
      }
 
      <div class="card">
-       <h2>Connected mailboxes</h2>
+       <h2>Connected accounts</h2>
        ${accountRows}
        <div class="row">
          <div class="grow muted">
@@ -320,12 +325,23 @@ export function dashboardPage(params: {
                  'not available for Microsoft mailboxes.'
                : ''
            }
+           ${
+             slackAvailable
+               ? 'A Slack account adds chat only — reading and writing the conversations the ' +
+                 'member can already see.'
+               : ''
+           }
          </div>
          <div>
            <a class="btn primary" href="/accounts/connect">Connect Google</a>
            ${
              microsoftAvailable
                ? '<a class="btn" href="/accounts/connect?provider=microsoft">Connect Microsoft</a>'
+               : ''
+           }
+           ${
+             slackAvailable
+               ? '<a class="btn" href="/accounts/connect?provider=slack">Connect Slack</a>'
                : ''
            }
          </div>

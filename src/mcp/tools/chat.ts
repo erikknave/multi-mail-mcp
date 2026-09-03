@@ -2,6 +2,8 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { User } from '../../db/repo.js';
 import { ReauthRequiredError } from '../../oauth/errors.js';
+import { hasCapability, providerSupports } from '../../oauth/capabilities.js';
+import { capabilityLabel, PROVIDERS } from '../../providers.js';
 import {
   chatApi,
   listAccounts,
@@ -15,31 +17,36 @@ import { guard, ok, partial, type AccountProblem } from '../reply.js';
 /**
  * Short on purpose, and repeated on purpose.
  *
- * These tools are only registered when a Microsoft mailbox is connected, so the
- * long explanation that used to live here is no longer earning its context: a
- * user with no Microsoft mailbox never sees these tools at all. What remains is
- * for the mixed case, where the model still has to pick the right mailbox.
+ * These tools are only registered when a chat-capable account is connected
+ * (Microsoft or Slack), so the long explanation that used to live here is no
+ * longer earning its context: a user with no such account never sees these
+ * tools at all. What remains is for the mixed case, where the model still has
+ * to pick the right account.
  */
-const MICROSOFT_ONLY = 'Microsoft mailboxes only — check `capabilities` in list_accounts.';
+const CHAT_ACCOUNTS = 'Chat-capable accounts only — check `capabilities` in list_accounts.';
 
 const accountArg = z
   .string()
   .optional()
   .describe(
-    'Microsoft mailbox address whose chats to use. Omit when only one Microsoft mailbox ' +
+    'Account address whose chats to use. Omit when only one chat-capable account ' +
       'is connected.',
   );
 
-/** Explains an empty result caused by there being no Microsoft mailbox at all. */
+/** Explains an empty result caused by there being no chat-capable account at all. */
 function noChatAccountsMessage(user: User): string {
   const all = listAccounts(user);
-  if (all.length === 0) return 'No mailboxes are connected yet.';
+  if (all.length === 0) return 'No accounts are connected yet.';
+
+  const chatProviders = PROVIDERS.filter((p) => providerSupports(p, 'chat')).map((p) =>
+    capabilityLabel(p, 'chat'),
+  );
 
   return (
-    'None of the connected mailboxes can use Teams chat. Connected: ' +
+    'None of the connected accounts can use chat. Connected: ' +
     `${all.map((a) => `${a.email} (${a.provider})`).join(', ')}. ` +
-    'Teams chat needs a Microsoft mailbox — the user can connect one from the dashboard. ' +
-    'Do not report this as "no chats found": nothing was searched.'
+    `Chat needs a ${chatProviders.join(' or ')} account — the user can connect one from the ` +
+    'dashboard. Do not report this as "no chats found": nothing was searched.'
   );
 }
 
@@ -51,23 +58,24 @@ export function registerChatTools(server: McpServer, user: User): void {
   server.registerTool(
     'list_chats',
     {
-      title: 'List Teams chats',
+      title: 'List chats',
       description:
-        `Lists recent Teams chats, most recently active first, with their participants and a ` +
-        `preview of the last message. Reading and posting both need a chatId from here; ` +
+        `Lists recent chat conversations, most recently active first, with their participants ` +
+        `and a preview of the last message. Reading and posting both need a chatId from here; ` +
         `start_chat creates one with someone not in the list.\n\n` +
-        `\`isExternal\` marks a chat containing anyone outside the account's organisation, ` +
-        `and each participant carries the same flag — check it before replying, since an ` +
-        `answer there leaves the organisation.\n\n` +
-        `Chats in another organisation's tenant that this account is only a guest in are not ` +
-        `reachable and will not appear.\n\n${MICROSOFT_ONLY}`,
+        `Teams shows the chats the account belongs to. Slack shows channels, DMs and group ` +
+        `DMs — a channel's name is its identity and it carries no participant list.\n\n` +
+        `\`isExternal\` marks a conversation containing anyone outside the account's ` +
+        `organisation — on Teams a guest or federated participant, on Slack a Slack Connect ` +
+        `conversation. Check it before replying, since an answer there leaves the ` +
+        `organisation.\n\n${CHAT_ACCOUNTS}`,
       inputSchema: {
         accounts: z
           .array(z.string())
           .optional()
           .describe(
-            'Mailbox addresses to look in. Omit to use every Microsoft mailbox; any Google ' +
-              'mailboxes are then reported under skippedAccounts rather than failing.',
+            'Account addresses to look in. Omit to use every chat-capable account; any others ' +
+              'are then reported under skippedAccounts rather than failing.',
           ),
         limit: z.number().int().min(1).max(50).default(20).describe('Max chats per account.'),
         nameContains: z
@@ -75,14 +83,16 @@ export function registerChatTools(server: McpServer, user: User): void {
           .optional()
           .describe(
             'Filter to chats whose topic or participant names contain this text. Applied ' +
-              'after fetching — Teams has no server-side chat search.',
+              'after fetching — neither Teams nor Slack offers server-side chat search.',
           ),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
     async ({ accounts, limit, nameContains }) =>
       guard(async () => {
-        const requested = resolveAccounts(user, accounts);
+        // The capability hint settles the address a Slack account shares with
+        // a mailbox: naming "erik@…" for chats means the Slack row.
+        const requested = resolveAccounts(user, accounts, { capability: 'chat' });
 
         // An explicitly named Google mailbox is a mistake worth reporting; an
         // unfiltered "list my chats" is not, so it narrows and says that it did.
@@ -170,15 +180,18 @@ export function registerChatTools(server: McpServer, user: User): void {
   server.registerTool(
     'read_chat',
     {
-      title: 'Read a Teams chat',
+      title: 'Read a chat',
       description:
-        `Reads the most recent messages in one Teams chat, oldest first so the exchange reads ` +
-        `in order. Bodies are converted from HTML to text and @-mentions are listed as ` +
-        `written. System events (someone added, chat renamed, call ended) are included and ` +
-        `flagged \`isSystemEvent\`.\n\n` +
+        `Reads the most recent messages in one chat, oldest first so the exchange reads in ` +
+        `order. Bodies arrive as text — Teams HTML is converted, Slack keeps its mrkdwn — and ` +
+        `@-mentions are listed as written. System events (someone added, chat renamed, ` +
+        `channel joined) are included and flagged \`isSystemEvent\`.\n\n` +
+        `On Slack, thread replies are flattened in after their parent: each reply carries ` +
+        `\`inThreadOf\`, the parent carries \`replyCount\`, and \`threadTruncated\` says when ` +
+        `more replies exist than were fetched.\n\n` +
         `Attachments come back as a name and a link only: the file lives in the sender's ` +
-        `OneDrive or SharePoint and this server holds no file permissions for Microsoft ` +
-        `accounts, so hand the url to the user.\n\n${MICROSOFT_ONLY}`,
+        `OneDrive or SharePoint (Teams) or behind Slack's permalink, and this server holds no ` +
+        `file permissions for either, so hand the url to the user.\n\n${CHAT_ACCOUNTS}`,
       inputSchema: {
         chatId: z.string().describe('Chat id, from list_chats.'),
         account: accountArg,
@@ -249,16 +262,17 @@ export function registerChatTools(server: McpServer, user: User): void {
   server.registerTool(
     'start_chat',
     {
-      title: 'Start a Teams chat',
+      title: 'Start a chat',
       description:
-        `Creates a Teams chat with one or more people, named by email address, and returns ` +
-        `its chatId. Use it when the person has no chat in list_chats yet.\n\n` +
+        `Creates a chat with one or more people, named by email address, and returns its ` +
+        `chatId. Use it when the person has no chat in list_chats yet.\n\n` +
         `Nobody is notified: an empty chat is invisible to the others until the first ` +
         `send_chat_message.\n\n` +
-        `One other person makes a one-to-one chat, and Teams allows only one per pair — ` +
-        `asking for one that exists returns that conversation with its history and sets ` +
-        `\`alreadyExisted\`. Several people make a group chat, where calling twice really ` +
-        `does create two. You are added automatically.\n\n${MICROSOFT_ONLY}`,
+        `One other person makes a one-to-one chat, several make a group. Asking for a ` +
+        `one-to-one chat that exists returns that conversation with its history and sets ` +
+        `\`alreadyExisted\` — creating a second is not possible on either provider. Whether ` +
+        `a topic can be named, and how large a group may be, differs; a refusal says exactly ` +
+        `what the provider allows. You are added automatically.\n\n${CHAT_ACCOUNTS}`,
       inputSchema: {
         participants: z
           .array(z.string())
@@ -271,8 +285,8 @@ export function registerChatTools(server: McpServer, user: User): void {
           .string()
           .optional()
           .describe(
-            'Name for a group chat. Not allowed for a one-to-one chat, which Teams names ' +
-              'after the other person.',
+            'Name for a group chat. Teams allows it for group chats only; Slack names its ' +
+              'group DMs itself and refuses a topic.',
           ),
         account: accountArg,
       },
@@ -316,24 +330,37 @@ export function registerChatTools(server: McpServer, user: User): void {
   server.registerTool(
     'send_chat_message',
     {
-      title: 'Post to a Teams chat',
+      title: 'Post to a chat',
       description:
-        `Posts to an existing Teams chat as the connected account. Immediate and visible to ` +
+        `Posts to an existing chat as the connected account. Immediate and visible to ` +
         `everyone in it, with no draft state and no unsend — confirm the wording with the ` +
         `user first, and check \`isExternal\` for whether it leaves the organisation. Use ` +
-        `start_chat for someone you have not messaged before.\n\n${MICROSOFT_ONLY}`,
+        `start_chat for someone you have not messaged before.\n\n` +
+        `\`body\` is plain text by default; \`isHtml\` works on Teams only, since Slack ` +
+        `messages are mrkdwn. \`threadTs\` replies into a Slack thread — the parent ` +
+        `message's id from read_chat; Teams chats have no threads.\n\n${CHAT_ACCOUNTS}`,
       inputSchema: {
         chatId: z.string().describe('Chat id, from list_chats.'),
         body: z.string().min(1).describe('Message text. Plain text unless isHtml is set.'),
         isHtml: z
           .boolean()
           .default(false)
-          .describe('Send as HTML, for links and simple formatting. Plain text otherwise.'),
+          .describe(
+            'Send as HTML, for links and simple formatting. Teams only — Slack messages are ' +
+              'mrkdwn and refuse HTML.',
+          ),
+        threadTs: z
+          .string()
+          .optional()
+          .describe(
+            'Reply into a thread instead of the conversation: the parent message id from ' +
+              'read_chat. Slack only.',
+          ),
         account: accountArg,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
-    async ({ chatId, body, isHtml, account }) =>
+    async ({ chatId, body, isHtml, threadTs, account }) =>
       guard(async () => {
         const acc = resolveChatAccount(user, account);
         const api = await chatApi(acc);
@@ -341,7 +368,11 @@ export function registerChatTools(server: McpServer, user: User): void {
         // Fetched before posting so the result can state where the message went,
         // and whether it left the organisation.
         const chat = await api.getChat(chatId);
-        const sent = await api.sendMessage(chatId, { body, isHtml });
+        const sent = await api.sendMessage(chatId, {
+          body,
+          isHtml,
+          ...(threadTs ? { threadParentId: threadTs } : {}),
+        });
 
         return ok({
           sent: true,
@@ -357,22 +388,39 @@ export function registerChatTools(server: McpServer, user: User): void {
   );
 
   /**
-   * Picks the mailbox for a single-chat operation.
+   * Picks the account for a single-chat operation.
    *
-   * With no address given and several mailboxes connected, resolveAccount
-   * refuses to guess — but for a chat tool the Google ones were never
-   * candidates, so it narrows to the Microsoft mailboxes first and only asks the
-   * caller to choose when the choice is real.
+   * With no address given and several accounts connected, resolveAccount
+   * refuses to guess — but for a chat tool the non-chat ones were never
+   * candidates, so it narrows to the chat-capable accounts first and only asks
+   * the caller to choose when the choice is real.
+   *
+   * A named address can now belong to more than one account: a Slack
+   * membership shares its email with a mailbox. For a chat tool the
+   * chat-capable row is the one that was meant.
    */
   function resolveChatAccount(forUser: User, email?: string) {
-    if (email) return resolveAccount(forUser, email);
+    if (email) {
+      const normalized = email.toLowerCase().trim();
+      const capable = listAccounts(forUser).filter(
+        (a) => a.email === normalized && hasCapability(a, 'chat'),
+      );
+      if (capable.length > 1) {
+        throw new ServiceError(
+          `"${email}" is connected as more than one chat-capable account ` +
+            `(${capable.map((a) => a.provider).join(' and ')}), so the address alone does not ` +
+            'say which is meant. Disconnect one of them from the dashboard.',
+        );
+      }
+      return resolveAccount(forUser, email, { capability: 'chat' });
+    }
 
     const { capable } = splitByCapability(listAccounts(forUser), 'chat');
     if (capable.length === 1) return capable[0]!;
     if (capable.length === 0) throw new ServiceError(noChatAccountsMessage(forUser));
 
     throw new ServiceError(
-      `Several Microsoft mailboxes are connected (${capable.map((a) => a.email).join(', ')}). ` +
+      `Several chat-capable accounts are connected (${capable.map((a) => a.email).join(', ')}). ` +
         'Specify which one with the "account" argument.',
     );
   }

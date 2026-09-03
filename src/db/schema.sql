@@ -40,15 +40,18 @@ CREATE TABLE IF NOT EXISTS api_keys (
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
 
--- Connected mailboxes, one row per address per user.
--- provider: 'google' | 'microsoft'  -- which service hosts this mailbox
+-- Connected accounts, one row per address per provider per user. A Slack
+-- membership legitimately shares its email with a mailbox of the same user,
+-- so the address alone cannot be the key.
+-- provider: 'google' | 'microsoft' | 'slack'
 -- status:   'active' | 'needs_reauth'
 CREATE TABLE IF NOT EXISTS accounts (
   id                    TEXT PRIMARY KEY,
   user_id               TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   email                 TEXT NOT NULL,
   provider              TEXT NOT NULL DEFAULT 'google',
-  -- The provider's stable id for the account: Google's `sub`, Microsoft's `oid`.
+  -- The provider's stable id for the account: Google's `sub`, Microsoft's
+  -- `oid`, Slack's workspace-scoped user id.
   provider_sub          TEXT,
   display_name          TEXT,
   refresh_token_enc     TEXT,
@@ -60,7 +63,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   last_ok_at            INTEGER,
   created_at            INTEGER NOT NULL,
   updated_at            INTEGER NOT NULL,
-  UNIQUE(user_id, email)
+  UNIQUE(user_id, provider, email)
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id);
 -- Lets a sign-in resolve to the owner of an already-connected mailbox.

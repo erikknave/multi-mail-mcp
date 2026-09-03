@@ -1,7 +1,8 @@
 # multi-mail-mcp
 
 An MCP server that gives an AI agent access to **several mailboxes at once** —
-Gmail / Google Workspace and Microsoft 365 / Outlook side by side. Searching and
+Gmail / Google Workspace and Microsoft 365 / Outlook side by side, plus Slack
+for reading and writing chat. Searching and
 reading mail, reading and updating calendars, reading and writing Google Drive,
 editing Sheets and Docs in place, and moving attachments in and out.
 
@@ -9,13 +10,13 @@ Mail and calendar work identically whichever service a mailbox is on: the same
 Gmail query syntax, the same label names, the same recurrence rules. The rest is
 whatever the provider actually has:
 
-| | Google | Microsoft |
-|---|:---:|:---:|
-| Mail | ● | ● |
-| Calendar | ● | ● |
-| Drive, Sheets, Docs | ● | — |
-| Teams chat | — | ● |
-| Sign-in | ● | — |
+| | Google | Microsoft | Slack |
+|---|:---:|:---:|:---:|
+| Mail | ● | ● | — |
+| Calendar | ● | ● | — |
+| Drive, Sheets, Docs | ● | — | — |
+| Chat | — | Teams ● | ● |
+| Sign-in | ● | — | — |
 
 Every account reports its own `capabilities` from `list_accounts`, and a tool
 called against a provider that lacks the capability answers `NOT AVAILABLE`
@@ -35,16 +36,18 @@ Runs as a single Node process with a SQLite database and a small web UI.
 │   /                          web UI — mailboxes, keys      │
 │   /oauth/google/callback     Google sign-in + consent      │
 │   /oauth/microsoft/callback  Microsoft mailbox consent     │
+│   /oauth/slack/callback       Slack account consent        │
 │   /reauth/<token>            one-click access renewal      │
 │   /files/attachment/…        signed attachment download    │
 │   /files/upload/…            signed attachment upload      │
 │                                                            │
 │   SQLite: users, mailboxes, keys, staged uploads           │
 └────────────────────────────────────────────────────────────┘
-             │                              │
-             ▼                              ▼
-   Gmail / Calendar / Drive         Microsoft Graph
-   (per Google mailbox)             (per Microsoft mailbox)
+             │                              │            │
+             ▼                              ▼            ▼
+   Gmail / Calendar / Drive         Microsoft Graph     Slack Web API
+   (per Google mailbox)             (per Microsoft      (per Slack account,
+                                       mailbox)            user token)
 ```
 
 Mail is **not** mirrored locally. Every search goes straight to Gmail, so results
@@ -248,7 +251,7 @@ Three more Graph behaviours worth not rediscovering:
 `list_chats`, `read_chat`, `start_chat` and `send_chat_message` cover the chats
 the connected account itself belongs to — one-to-one, group and meeting chats —
 including **federated** ones where someone from another organisation is writing
-to you.
+to you. The same four tools serve a connected Slack account (see below).
 
 Creating and sending are separate tools, which is not an accident: a chat with no
 messages in it is invisible to the other people, so `start_chat` notifies nobody
@@ -281,19 +284,75 @@ description says plainly so an agent confirms the wording first.
 
 ---
 
+## Connecting Slack accounts
+
+Slack support is optional like Microsoft's: it appears once `SLACK_CLIENT_ID`
+and `SLACK_CLIENT_SECRET` are set, and without them the dashboard does not offer
+it. A Slack account is **chat-only** — it adds the four chat tools and nothing
+else.
+
+In **api.slack.com/apps → Create New App → From scratch** (any name, your
+workspace as the development workspace — an app used only in its own workspace
+needs no distribution review):
+
+1. **OAuth & Permissions → Redirect URLs** — add exactly
+   `<PUBLIC_BASE_URL>/oauth/slack/callback`.
+2. **OAuth & Permissions → User Token Scopes** (not Bot Token Scopes):
+   `channels:read`, `groups:read`, `im:read`, `mpim:read`,
+   `channels:history`, `groups:history`, `im:history`, `mpim:history`,
+   `chat:write`, `im:write`, `mpim:write`, `users:read`, `users:read.email`.
+3. **Leave token rotation off.** The token this server stores is the user token
+   itself, which does not expire; enabling rotation would mint refresh tokens
+   the server has no path to use, and the access token would silently die.
+4. Copy **Client ID** and **Client Secret** (Basic Information → App
+   Credentials) into `.env`, rebuild and restart.
+
+There is no "Install to Workspace" step — a user-scope-only app has no bot to
+install. The dashboard's **Connect Slack** button starts the authorisation and
+the token comes back to the callback. Re-authorising later is the same flow, via
+the re-auth links the tools hand out.
+
+The token is a **user token (xoxp)**: the agent reads exactly the conversations
+the member can read and posts as them, mirroring how Teams chat access is
+delegated. No bot token is requested, and no scope for creating or renaming
+channels.
+
+### What differs on Slack
+
+- **Threads are read and answered, not flattened away.** `read_chat` fetches a
+  thread's replies and flattens them in after the parent — replies carry
+  `inThreadOf`, the parent `replyCount`, and `threadTruncated` says when more
+  exist than the 20 fetched per thread. `send_chat_message` replies into a
+  thread with `threadTs`. Teams has no threads at all.
+- **Bodies are mrkdwn, not HTML.** `isHtml` is refused on Slack rather than
+  converted — converting would silently drop link targets and formatting.
+- **Channels have no participant list.** A channel's name is its identity;
+  listing every member of every channel would be an unbounded fan-out for no
+  decision an agent needs to make. DMs and group DMs list their people.
+- **`isExternal` means Slack Connect.** Conversations shared with an outside
+  organisation are flagged, but which organisations they are cannot be named
+  without member calls the server does not make.
+- **One workspace per member email.** The account is keyed on the Slack profile
+  address; authorising a second workspace whose profile email matches replaces
+  the first.
+- **Attachments are permalinks**, like Teams attachments — a name and a link to
+  hand to the user, no bytes.
+
+---
+
 ## Tools
 
 Mail, calendar and account tools work with both providers. Drive, Sheets and Docs
-are Google-only; Teams chat is Microsoft-only.
+are Google-only; chat works on Microsoft (Teams) and Slack.
 
-**Only the tools your mailboxes can use are registered.** A tool that could
+**Only the tools your accounts can use are registered.** A tool that could
 only ever answer "not available for this account" is not worth the context it
 costs to describe, and a shorter list is one a model chooses from more
 accurately. So the Drive, Sheets and Docs tools appear once a Google mailbox is
-connected, the Teams chat tools once a Microsoft one is, and a user with nothing
-connected sees only the three account tools — which is what tells them to
-connect a mailbox. In tokens, the full surface is around 17k; a Microsoft-only
-user sees about 8.7k, and a user with no mailboxes about 0.8k.
+connected, the chat tools once a Microsoft or Slack one is, and a user with
+nothing connected sees only the three account tools — which is what tells them
+to connect an account. In tokens, the full surface is around 17k; a
+Microsoft-only user sees about 8.7k, and a user with no mailboxes about 0.8k.
 
 The endpoint is stateless, so the list is recomputed on every request and needs
 no cache invalidating. A client that caches `tools/list` may need to reconnect
@@ -308,7 +367,7 @@ before newly connected mailboxes bring their tools into view.
 `update_event`, `delete_event`, `respond_to_event`, `find_free_time`,
 `find_rooms`
 
-**Teams chat** (Microsoft only) — `list_chats`, `read_chat`, `start_chat`,
+**Chat** (Microsoft and Slack) — `list_chats`, `read_chat`, `start_chat`,
 `send_chat_message`
 
 **Drive** — `search_drive`, `read_drive_file`, `list_drive_folder`,
@@ -462,14 +521,16 @@ All settings live in `.env` (see `.env.example`). The ones that matter:
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OAuth client, type *Web application*. |
 | `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET` | Entra ID app registration. Blank disables Microsoft mailboxes. |
 | `MICROSOFT_AUTHORITY` | `organizations` (default), a tenant id, or `common` to allow personal accounts. |
+| `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` | Slack app credentials. Blank disables Slack chat. |
 | `ALLOWED_LOGIN_EMAILS` | Comma-separated addresses allowed to create a user. |
 | `ENCRYPTION_KEY` | 32 random bytes, base64. Encrypts refresh tokens at rest. |
 | `URL_SIGNING_SECRET` | 32 random bytes, base64. Signs download, upload and renewal links. |
 | `MAX_UPLOAD_BYTES` | Attachment size cap, default 25 MB (Gmail's own ceiling). |
 
 The redirect URIs must match exactly: `<PUBLIC_BASE_URL>/oauth/google/callback`
-in Google Cloud Console, and `<PUBLIC_BASE_URL>/oauth/microsoft/callback` in
-Entra ID.
+in Google Cloud Console, `<PUBLIC_BASE_URL>/oauth/microsoft/callback` in
+Entra ID, and `<PUBLIC_BASE_URL>/oauth/slack/callback` in the Slack app's
+OAuth & Permissions.
 
 **Rotating `ENCRYPTION_KEY` or `URL_SIGNING_SECRET` invalidates existing data**:
 a new encryption key makes every stored refresh token unreadable, so every
@@ -500,7 +561,10 @@ mailbox has to be reconnected.
 - **Chat access is delegated, never application-wide.** `Chat.ReadWrite` reaches
   only the chats the signed-in user is already in — there is no path to reading
   the organisation's messages, and the gated application permissions that would
-  allow it are not requested.
+  allow it are not requested. Slack is the same stance with a user token: it
+  reads and posts as the member who authorised it, holds no bot token, and
+  requests no scope for creating or renaming channels. The token is stored
+  AES-256-GCM-encrypted like every other credential.
 - **`gmail.modify` is requested, not `gmail.full`**, and `Mail.ReadWrite` rather
   than anything wider — an agent can archive, label and trash, but cannot
   permanently delete mail. Drive follows the same line: the server never calls

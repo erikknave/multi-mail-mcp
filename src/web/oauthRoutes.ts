@@ -12,6 +12,11 @@ import {
   microsoftEnabled,
   parseOAuthState as parseMicrosoftState,
 } from '../microsoft/oauth.js';
+import {
+  exchangeCode as exchangeSlackCode,
+  parseOAuthState as parseSlackState,
+  slackEnabled,
+} from '../slack/oauth.js';
 import { consentUrlFor } from '../oauth/consent.js';
 import { parseReauthToken } from '../oauth/links.js';
 import { providerLabel, type Provider } from '../providers.js';
@@ -85,25 +90,37 @@ function storeMailbox(
   provider: Provider,
   identity: Identity,
 ): Response | Promise<Response> {
-  const existing = accounts.byUserAndEmail(user.id, identity.email);
+  const existing = accounts.byUserAndEmail(user.id, identity.email, provider);
 
-  if (existing && existing.provider !== provider) {
-    return c.html(
-      messagePage(
-        'Already connected elsewhere',
-        `${identity.email} is already connected as a ${providerLabel(existing.provider)} mailbox`,
-        `One address can only be connected once. Disconnect the ${providerLabel(existing.provider)} ` +
-          `mailbox on the dashboard first if you want to reconnect it through ` +
-          `${providerLabel(provider)}.`,
-        'err',
-      ),
-      409,
-    );
+  // One address can still only be one *mailbox*: Google and Microsoft would
+  // both answer the same mail tools for it. A Slack account is chat-only and
+  // deliberately shares its member email with a mailbox, so it is exempt.
+  const mailboxProviders: Provider[] = ['google', 'microsoft'];
+  if (mailboxProviders.includes(provider)) {
+    const clash = mailboxProviders
+      .filter((p) => p !== provider)
+      .map((p) => accounts.byUserAndEmail(user.id, identity.email, p))
+      .find(Boolean);
+    if (clash) {
+      return c.html(
+        messagePage(
+          'Already connected elsewhere',
+          `${identity.email} is already connected as a ${providerLabel(clash.provider)} mailbox`,
+          `One address can only be connected once. Disconnect the ${providerLabel(clash.provider)} ` +
+            `mailbox on the dashboard first if you want to reconnect it through ` +
+            `${providerLabel(provider)}.`,
+          'err',
+        ),
+        409,
+      );
+    }
   }
 
-  if (!identity.refreshToken && !existing?.refresh_token_enc) {
-    // Without a refresh token we could not renew access later, so refuse rather
-    // than store a mailbox that breaks in an hour.
+  // Without a refresh token we could not renew access later, so refuse rather
+  // than store a mailbox that breaks in an hour. Slack is the exception by
+  // design: its user tokens do not expire, so there is no refresh token to ask
+  // for and the token itself is the long-lived credential.
+  if (provider !== 'slack' && !identity.refreshToken && !existing?.refresh_token_enc) {
     const fix =
       provider === 'google'
         ? 'Remove this app at https://myaccount.google.com/permissions and try connecting again.'
@@ -126,8 +143,10 @@ function storeMailbox(
     providerSub: identity.sub,
     displayName: identity.name,
     refreshTokenEnc: identity.refreshToken ? encrypt(identity.refreshToken) : null,
-    accessTokenEnc: encrypt(identity.accessToken),
-    accessTokenExpires: identity.accessTokenExpires,
+    // Slack's token does not expire, so there is no access token to cache
+    // ahead of an expiry that will never arrive — one authoritative slot.
+    accessTokenEnc: provider === 'slack' ? null : encrypt(identity.accessToken),
+    accessTokenExpires: provider === 'slack' ? null : identity.accessTokenExpires,
     scopes: identity.scopes,
   });
 
@@ -358,4 +377,120 @@ oauthRoutes.get('/oauth/microsoft/callback', async (c) => {
   }
 
   return storeMailbox(c, user, 'microsoft', identity);
+});
+
+/* ------------------------------------------------------------------ *
+ * Slack: connect and renew only
+ * ------------------------------------------------------------------ */
+
+/**
+ * Like Microsoft, Slack is a way to add an account, never a way to get in —
+ * sign-in stays Google-only, so the state must carry a user and (unless this
+ * is a signed re-auth link) an active session for that same user.
+ */
+oauthRoutes.get('/oauth/slack/callback', async (c) => {
+  if (!slackEnabled()) {
+    return c.html(
+      messagePage(
+        'Not configured',
+        'Slack accounts are switched off',
+        'This server has no Slack app configured.',
+        'err',
+      ),
+      404,
+    );
+  }
+
+  const error = c.req.query('error');
+  if (error) {
+    return c.html(
+      messagePage(
+        'Connection cancelled',
+        'Slack returned an error',
+        `Slack said: ${error}${c.req.query('error_description') ? ` — ${c.req.query('error_description')}` : ''}`,
+        'err',
+      ),
+      400,
+    );
+  }
+
+  const code = c.req.query('code');
+  const rawState = c.req.query('state');
+  if (!code || !rawState) {
+    return c.html(
+      messagePage('Bad request', 'Incomplete response from Slack', 'Missing code or state.', 'err'),
+      400,
+    );
+  }
+
+  const state = parseSlackState(rawState);
+  if (!state) {
+    return c.html(
+      messagePage(
+        'Session expired',
+        'That attempt timed out',
+        'Consent links are valid for ten minutes. Please start again.',
+        'err',
+      ),
+      400,
+    );
+  }
+
+  if (!state.uid) {
+    return c.html(
+      messagePage(
+        'Sign in first',
+        'Slack cannot be used to sign in',
+        'Sign in with Google, then connect Slack from the dashboard.',
+        'err',
+      ),
+      403,
+    );
+  }
+
+  const sessionUser = currentUser(c);
+  if (!state.expectEmail && sessionUser?.id !== state.uid) {
+    return c.html(
+      messagePage('Signed out', 'Your session ended', 'Please sign in again and retry.', 'err'),
+      403,
+    );
+  }
+
+  let identity: Identity;
+  try {
+    identity = await exchangeSlackCode(code);
+  } catch (err) {
+    // Cloudflare replaces 5xx bodies with its own page, so the reason has to
+    // reach the journal too or the failure is undiagnosable from outside.
+    console.error(`slack callback exchange failed: ${(err as Error).message}`);
+    return c.html(
+      messagePage(
+        'Connection failed',
+        'Could not complete the exchange with Slack',
+        (err as Error).message,
+        'err',
+      ),
+      502,
+    );
+  }
+
+  if (state.expectEmail && identity.email !== state.expectEmail) {
+    return c.html(
+      messagePage(
+        'Wrong account',
+        'That is a different Slack member',
+        `You authorized the profile ${identity.email}, but this link is for ${state.expectEmail}. ` +
+          `Switch Slack account and open the link again.`,
+        'err',
+      ),
+      400,
+    );
+  }
+
+  const user = users.byId(state.uid);
+  if (!user) {
+    return c.html(messagePage('Unknown user', 'Account not found', 'Please sign in again.', 'err'), 404);
+  }
+
+  return storeMailbox(c, user, 'slack', identity);
 });

@@ -1,4 +1,4 @@
-import { GRAPH_SCOPE_FOR, SCOPE_FOR, type Capability } from '../config.js';
+import { GRAPH_SCOPE_FOR, SCOPE_FOR, SLACK_SCOPE_FOR, type Capability } from '../config.js';
 import type { Account } from '../db/repo.js';
 import { capabilityLabel, providerLabel, PROVIDERS, type Provider } from '../providers.js';
 import { ScopeMissingError, UnsupportedForProviderError } from './errors.js';
@@ -14,9 +14,16 @@ function normalizeGraphScope(scope: string): string {
   return (scope.split('/').pop() ?? scope).toLowerCase();
 }
 
+/** The one place that knows which scope map belongs to which provider. */
+const SCOPE_MAP_FOR: Record<Provider, Record<Capability, string | null>> = {
+  google: SCOPE_FOR,
+  microsoft: GRAPH_SCOPE_FOR,
+  slack: SLACK_SCOPE_FOR,
+};
+
 /** The scope a provider needs for a capability, or null if it has no such thing. */
 export function scopeFor(provider: Provider, capability: Capability): string | null {
-  return provider === 'microsoft' ? GRAPH_SCOPE_FOR[capability] : SCOPE_FOR[capability];
+  return SCOPE_MAP_FOR[provider][capability];
 }
 
 /** Whether a provider offers a capability at all, granted or not. */
@@ -29,7 +36,9 @@ export function hasCapability(account: Account, capability: Capability): boolean
   const needed = scopeFor(account.provider, capability);
   if (!needed) return false;
 
-  const granted = (account.scopes ?? '').split(/\s+/).filter(Boolean);
+  // Comma or space: Slack's oauth.v2.access returns the granted scopes as a
+  // comma-separated string, Google and Microsoft as space-separated.
+  const granted = (account.scopes ?? '').split(/[,\s]+/).filter(Boolean);
 
   if (account.provider === 'microsoft') {
     return granted.map(normalizeGraphScope).includes(normalizeGraphScope(needed));
@@ -50,7 +59,7 @@ export function capabilitiesOf(account: Account): Capability[] {
  */
 const ALTERNATIVE: Partial<Record<Capability, string>> = {
   drive: 'Use a connected Google mailbox instead, or ask the user to attach the file to mail.',
-  chat: 'Use a connected Microsoft mailbox instead, or reach the person by mail.',
+  chat: 'Use a connected account that supports chat instead, or reach the person by mail.',
 };
 
 /**

@@ -1,7 +1,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Capability } from '../config.js';
 import type { User } from '../db/repo.js';
-import { capabilitiesOf } from '../oauth/capabilities.js';
+import { capabilitiesOf, hasCapability } from '../oauth/capabilities.js';
+import { providerLabel } from '../providers.js';
 import { listAccounts } from '../service.js';
 import { registerAccountTools } from './tools/accounts.js';
 import { registerMailTools } from './tools/mail.js';
@@ -17,43 +18,55 @@ function availableCapabilities(user: User): Set<Capability> {
   return new Set(listAccounts(user).flatMap(capabilitiesOf));
 }
 
-function instructionsFor(available: Set<Capability>): string {
+function instructionsFor(user: User, available: Set<Capability>): string {
+  // Chat is the one surface two providers offer; naming whose chat is
+  // connected stops the model reaching for the wrong product's habits.
+  const chatProviders = [
+    ...new Set(
+      listAccounts(user)
+        .filter((a) => hasCapability(a, 'chat'))
+        .map((a) => providerLabel(a.provider)),
+    ),
+  ];
+
   const surfaces: string[] = [];
   if (available.has('gmail')) surfaces.push('mail');
   if (available.has('calendar')) surfaces.push('calendars');
   if (available.has('drive')) surfaces.push('Google Drive, Sheets and Docs');
-  if (available.has('chat')) surfaces.push('Teams chat');
+  if (available.has('chat')) surfaces.push(`chat (${chatProviders.join(' and ')})`);
 
   if (surfaces.length === 0) {
     return (
       'Access to the signed-in user\'s mailboxes — except that none are connected yet, so ' +
       'there is nothing to work with and only the account tools are available.\n\n' +
       'Call `list_accounts` to confirm, then tell the user to open the web UI and connect a ' +
-      'Google or Microsoft mailbox. The rest of the tools appear once one exists: mail and ' +
-      'calendar for either provider, Drive/Sheets/Docs for Google, Teams chat for Microsoft.'
+      'Google or Microsoft mailbox, or a Slack account. The rest of the tools appear once ' +
+      'one exists: mail and calendar for either mailbox provider, Drive/Sheets/Docs for ' +
+      'Google, chat for Microsoft and Slack.'
     );
   }
 
   return (
-    `Access to one or more mailboxes belonging to the signed-in user, hosted by Google ` +
-    `(Gmail, Calendar, Drive) or Microsoft (Outlook mail, calendar, Teams chat). ` +
+    `Access to one or more accounts belonging to the signed-in user: mailboxes hosted by ` +
+    `Google (Gmail, Calendar, Drive) or Microsoft (Outlook mail, calendar, Teams chat), ` +
+    `and Slack accounts (chat). ` +
     `Currently available: ${surfaces.join(', ')}.\n\n` +
-    'Start with `list_accounts` to see which mailboxes exist, which provider each is on, ' +
+    'Start with `list_accounts` to see which accounts exist, which provider each is on, ' +
     'what its `capabilities` are, and whether any need re-authentication. Most tools take ' +
-    'an optional `account` argument naming the mailbox address; omit it only when exactly ' +
-    'one mailbox could serve the request.\n\n' +
-    'The tool list reflects the mailboxes connected right now — Drive and Sheets tools ' +
-    'exist only while a Google mailbox is connected, Teams chat only while a Microsoft one ' +
-    'is. Connecting a mailbox mid-session may need the client to reconnect before the new ' +
-    'tools appear.\n\n' +
+    'an optional `account` argument naming the account address; omit it only when exactly ' +
+    'one account could serve the request.\n\n' +
+    'The tool list reflects the accounts connected right now — Drive and Sheets tools ' +
+    'exist only while a Google mailbox is connected, chat only while a Microsoft or Slack ' +
+    'one is. Connecting an account mid-session may need the client to reconnect before the ' +
+    'new tools appear.\n\n' +
     'Mail and calendar work identically for both providers: the same Gmail query syntax, ' +
     'the same label names, the same RRULE recurrence strings. Microsoft mailboxes translate ' +
     'these into folders, categories and Outlook patterns behind the scenes. Where something ' +
     'genuinely has no equivalent the response says so — a `queryNotes` entry on search, a ' +
     '`notes` entry on a calendar write — rather than quietly doing something else.\n\n' +
-    'A tool called against a mailbox whose provider does not offer it answers NOT ' +
+    'A tool called against an account whose provider does not offer it answers NOT ' +
     'AVAILABLE. That is not a permission problem: no link is given because no consent ' +
-    'screen would fix it. Check `capabilities` and use a mailbox that has what you need.\n\n' +
+    'screen would fix it. Check `capabilities` and use an account that has what you need.\n\n' +
     'Mail search returns compact summaries without bodies — call `get_message` or ' +
     '`get_thread` for the full text. Drive search uses Drive query syntax, which is not ' +
     "Gmail's; see the search_drive description.\n\n" +
@@ -63,7 +76,7 @@ function instructionsFor(available: Set<Capability>): string {
     'copy a tab with its formatting intact.\n\n' +
     'Results that span several accounts carry an `incomplete` flag. When it is true, some ' +
     'account could not be read: say so rather than reporting the result as complete, and ' +
-    'never conclude that something is absent from a mailbox you could not reach.\n\n' +
+    'never conclude that something is absent from an account you could not reach.\n\n' +
     'If a tool reports that an account needs re-authentication it will include a URL. Give ' +
     'that URL to the user, ask them to open it and sign in, then retry.'
   );
@@ -86,7 +99,7 @@ export function buildMcpServer(user: User): McpServer {
 
   const server = new McpServer(
     { name: 'multi-mail-mcp', version: '0.1.0' },
-    { instructions: instructionsFor(available) },
+    { instructions: instructionsFor(user, available) },
   );
 
   // Always registered: these are how an agent finds out what exists and what to

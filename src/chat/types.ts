@@ -20,9 +20,9 @@ export interface ChatParticipant {
 
 export interface ChatSummary {
   id: string;
-  /** Group chats can be named; one-to-one chats never are. */
+  /** Group chats and channels can be named; one-to-one chats never are. */
   topic: string | null;
-  /** oneOnOne | group | meeting */
+  /** oneOnOne | group | meeting | channel (Slack channels and DMs map onto these) */
   chatType: string;
   lastUpdated: string | null;
   webUrl: string | null;
@@ -67,6 +67,15 @@ export interface ChatMessageSummary {
   isDeleted: boolean;
   /** True when this is a system event — someone added, chat renamed, call ended. */
   isSystemEvent: boolean;
+  /**
+   * Set by providers with threads (Slack) on a message that is a reply: the
+   * parent message's id. Flat providers (Teams) never set it.
+   */
+  inThreadOf?: string;
+  /** Set on a thread parent: how many replies exist in the provider's thread. */
+  replyCount?: number;
+  /** True when the thread had more replies than were fetched. */
+  threadTruncated?: boolean;
 }
 
 export interface OutgoingChatMessage {
@@ -74,14 +83,19 @@ export interface OutgoingChatMessage {
   body: string;
   /** Send as HTML instead of plain text, for links and simple formatting. */
   isHtml?: boolean;
+  /**
+   * Reply into a thread rather than the conversation itself: the parent
+   * message's id. Providers without threads refuse it rather than ignoring it.
+   */
+  threadParentId?: string;
 }
 
 /**
  * Everything the chat tools need from a messaging account.
  *
- * Only Microsoft implements this. The interface exists anyway so the tools are
- * written against a capability rather than against Graph, and so a second
- * implementation would not mean rewriting them.
+ * The tools are written against this capability rather than against any
+ * provider's API, so a second implementation does not mean rewriting them —
+ * Microsoft Teams and Slack both implement it.
  */
 export interface ChatApi {
   readonly provider: Provider;

@@ -110,7 +110,12 @@ export async function guard(fn: () => Promise<CallToolResult>): Promise<CallTool
 
     const e = err as { message?: string; name?: string; errors?: Array<{ message?: string }> };
     const detail = e?.errors?.[0]?.message ?? e?.message ?? String(err);
-    const which = e?.name === 'GraphError' ? 'Microsoft Graph' : 'Google API';
+    const which =
+      e?.name === 'GraphError'
+        ? 'Microsoft Graph'
+        : e?.name === 'SlackApiError'
+          ? 'Slack API'
+          : 'Google API';
     return fail(`${which} call failed: ${detail}`);
   }
 }

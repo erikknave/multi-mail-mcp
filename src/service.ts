@@ -19,16 +19,17 @@ import { graphFor } from './microsoft/graph.js';
 import { microsoftCalendarApi } from './microsoft/calendar.js';
 import { microsoftChatApi } from './microsoft/chat.js';
 import { microsoftMailApi } from './microsoft/mail.js';
+import { slackChatApi } from './slack/chat.js';
+import { slackWebFor } from './slack/web.js';
 import type { MailApi } from './mail/types.js';
 import type { CalendarApi } from './calendar/types.js';
 import type { ChatApi } from './chat/types.js';
-import { providerSupports } from './oauth/capabilities.js';
+import { hasCapability, providerSupports } from './oauth/capabilities.js';
 import type { Capability } from './config.js';
 import { providerLabel, type Provider } from './providers.js';
 import {
   buildReauthUrl,
   getAuthorizedClient,
-  hasCapability,
   ReauthRequiredError,
   requireCapability,
   rethrowAsReauthIfNeeded,
@@ -51,8 +52,17 @@ export function listAccounts(user: User): Account[] {
  * single-account callers never have to name it. With several mailboxes we
  * refuse rather than guess — sending mail from the wrong address is not an
  * error worth being clever about.
+ *
+ * `capability` settles address collisions: a Slack account shares its email
+ * with a mailbox, so "erik@…" names two rows. A chat tool asking with the
+ * hint gets the Slack row, a mail tool the mailbox — the address means
+ * whichever one can actually do what was asked.
  */
-export function resolveAccount(user: User, email?: string): Account {
+export function resolveAccount(
+  user: User,
+  email?: string,
+  opts?: { capability?: Capability },
+): Account {
   const all = accounts.forUser(user.id);
 
   if (all.length === 0) {
@@ -70,7 +80,18 @@ export function resolveAccount(user: User, email?: string): Account {
   }
 
   const normalized = email.toLowerCase().trim();
-  const found = all.find((a) => a.email === normalized);
+  let found = all.find((a) => a.email === normalized);
+
+  if (found && opts?.capability) {
+    const capable = all.filter(
+      (a) => a.email === normalized && hasCapability(a, opts.capability!),
+    );
+    // Exactly one row with the capability: that is the one that was meant.
+    // Zero or several: leave the first match, whose downstream errors are
+    // precise either way.
+    if (capable.length === 1) found = capable[0];
+  }
+
   if (!found) {
     throw new ServiceError(
       `"${email}" is not a connected mailbox. Available: ${all.map((a) => a.email).join(', ')}.`,
@@ -80,7 +101,11 @@ export function resolveAccount(user: User, email?: string): Account {
 }
 
 /** Resolves several mailboxes at once; omitted `emails` means "all of them". */
-export function resolveAccounts(user: User, emails?: string[]): Account[] {
+export function resolveAccounts(
+  user: User,
+  emails?: string[],
+  opts?: { capability?: Capability },
+): Account[] {
   const all = accounts.forUser(user.id);
   if (all.length === 0) {
     throw new ServiceError(
@@ -89,7 +114,30 @@ export function resolveAccounts(user: User, emails?: string[]): Account[] {
   }
   if (!emails || emails.length === 0) return all;
 
-  return emails.map((email) => resolveAccount(user, email));
+  return emails.map((email) => resolveAccount(user, email, opts));
+}
+
+/**
+ * Targets for a fan-out tool. Named accounts are resolved as-is — asking for
+ * Teams chat in a named Gmail account is a mistake worth an error, and the
+ * capability hint has already settled the address a Slack account shares with
+ * a mailbox. An omitted list means "everything I have", where a chat-only
+ * account would fail every mail search with a capability error — so it is
+ * narrowed to what can actually do the thing, and the rest is reported as
+ * skipped rather than silently dropped.
+ */
+export function resolveFanoutTargets(
+  user: User,
+  emails: string[] | undefined,
+  capability: Capability,
+): {
+  targets: Account[];
+  skipped: ReturnType<typeof splitByCapability>['skipped'];
+} {
+  const requested = resolveAccounts(user, emails, { capability });
+  if (emails?.length) return { targets: requested, skipped: [] };
+  const { capable, skipped } = splitByCapability(requested, capability);
+  return { targets: capable, skipped };
 }
 
 /**
@@ -119,15 +167,40 @@ export async function calendarApi(account: Account): Promise<CalendarApi> {
 }
 
 /**
- * The chat interface for an account.
- *
- * Only Microsoft has one. requireCapability is what turns a Google account into
- * a precise "Teams chat is not available for this address" rather than a call
- * that fails somewhere further down.
+ * The chat interface for an account, whichever service hosts it — Teams for a
+ * Microsoft mailbox, Slack for a Slack account. requireCapability is what turns
+ * any other account into a precise "chat is not available for this address"
+ * rather than a call that fails somewhere further down.
  */
 export async function chatApi(account: Account): Promise<ChatApi> {
   requireCapability(account, 'chat');
+
+  if (account.provider === 'slack') {
+    return slackChatApi(await slackWebFor(account), account.email);
+  }
   return microsoftChatApi(await graphFor(account), account.email);
+}
+
+/**
+ * One real call against whatever the account can actually do, for health
+ * checks. A chat-only account has no mail profile to ask for, so probing
+ * everything through mailApi would report a perfectly healthy Slack account
+ * as unusable.
+ */
+export async function probeAccount(account: Account): Promise<{
+  probed: string;
+  stats?: Record<string, number>;
+  mailboxAddress?: string;
+}> {
+  if (hasCapability(account, 'gmail')) {
+    const profile = await (await mailApi(account)).getProfile();
+    return { probed: 'mail profile', stats: profile.stats, mailboxAddress: profile.emailAddress };
+  }
+  if (hasCapability(account, 'chat')) {
+    await (await chatApi(account)).listChats(1);
+    return { probed: 'chat list' };
+  }
+  throw new ServiceError(`${account.email} has no capability this server can probe.`);
 }
 
 /**

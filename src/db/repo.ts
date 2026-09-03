@@ -232,7 +232,7 @@ export const accounts = {
     scopes: string;
   }): Account {
     const email = params.email.toLowerCase().trim();
-    const existing = this.byUserAndEmail(params.userId, email);
+    const existing = this.byUserAndEmail(params.userId, email, params.provider);
     const ts = now();
 
     if (existing) {
@@ -287,10 +287,10 @@ export const accounts = {
     return db.prepare('SELECT * FROM accounts WHERE id = ?').get(id) as Account | undefined;
   },
 
-  byUserAndEmail(userId: string, email: string): Account | undefined {
+  byUserAndEmail(userId: string, email: string, provider: Provider): Account | undefined {
     return db
-      .prepare('SELECT * FROM accounts WHERE user_id = ? AND email = ?')
-      .get(userId, email.toLowerCase().trim()) as Account | undefined;
+      .prepare('SELECT * FROM accounts WHERE user_id = ? AND email = ? AND provider = ?')
+      .get(userId, email.toLowerCase().trim(), provider) as Account | undefined;
   },
 
   forUser(userId: string): Account[] {
@@ -303,10 +303,17 @@ export const accounts = {
    * Any user who has this address connected as a mailbox. Used at sign-in so
    * that logging in with a secondary address lands you in the same user account
    * rather than creating a duplicate one.
+   *
+   * Google rows win when both exist: sign-in is Google-only, so a Google
+   * sign-in must resolve to the Google row, never to a Slack row that happens
+   * to share the member email.
    */
   byEmailAnyUser(email: string): Account | undefined {
     return db
-      .prepare('SELECT * FROM accounts WHERE email = ? ORDER BY created_at LIMIT 1')
+      .prepare(
+        `SELECT * FROM accounts WHERE email = ?
+         ORDER BY CASE provider WHEN 'google' THEN 0 ELSE 1 END, created_at LIMIT 1`,
+      )
       .get(email.toLowerCase().trim()) as Account | undefined;
   },
 

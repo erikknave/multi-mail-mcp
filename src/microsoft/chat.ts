@@ -280,6 +280,12 @@ export function microsoftChatApi(graph: Graph, accountEmail: string): ChatApi {
         throw new ServiceError('Refusing to post an empty chat message.');
       }
 
+      if (message.threadParentId) {
+        throw new ServiceError(
+          'Teams chats have no threads to reply into — send to the chat itself.',
+        );
+      }
+
       const sent = await graph.post<GraphChatMessage>(
         `/chats/${encodeURIComponent(chatId)}/messages`,
         {

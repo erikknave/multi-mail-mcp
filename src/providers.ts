@@ -1,33 +1,43 @@
 /**
- * Which service an account's mail and calendar live in.
+ * Which service an account lives in.
  *
  * Sign-in is still Google-only (see auth.ts); this is about where a *mailbox*
- * is hosted, which is a separate question from how the user gets into this
- * service.
+ * — or, for Slack, a chat workspace membership — is hosted, which is a
+ * separate question from how the user gets into this service.
  */
-export type Provider = 'google' | 'microsoft';
+export type Provider = 'google' | 'microsoft' | 'slack';
 
-export const PROVIDERS: readonly Provider[] = ['google', 'microsoft'] as const;
+/**
+ * The order is load-bearing: requireCapability names its refusal after the
+ * first provider here that offers the capability, so a Google account refused
+ * chat says "Teams chat", not "Google Chat" (which this server does not
+ * implement).
+ */
+export const PROVIDERS: readonly Provider[] = ['google', 'microsoft', 'slack'] as const;
 
 export function isProvider(value: string): value is Provider {
-  return value === 'google' || value === 'microsoft';
+  return value === 'google' || value === 'microsoft' || value === 'slack';
 }
+
+const LABELS: Record<Provider, string> = {
+  google: 'Google',
+  microsoft: 'Microsoft',
+  slack: 'Slack',
+};
 
 /** Human name, for messages a user will read. */
 export function providerLabel(provider: Provider): string {
-  return provider === 'google' ? 'Google' : 'Microsoft';
+  return LABELS[provider];
 }
+
+const CAPABILITY_NAMES: Record<string, Partial<Record<Provider, string>>> = {
+  gmail: { google: 'Gmail', microsoft: 'Outlook mail' },
+  calendar: { google: 'Google Calendar', microsoft: 'Outlook calendar' },
+  drive: { google: 'Google Drive', microsoft: 'OneDrive' },
+  chat: { google: 'Google Chat', microsoft: 'Teams chat', slack: 'Slack' },
+};
 
 /** The product name for a capability, so errors name what the user recognises. */
 export function capabilityLabel(provider: Provider, capability: string): string {
-  const names: Record<string, [string, string]> = {
-    // [google name, microsoft name]
-    gmail: ['Gmail', 'Outlook mail'],
-    calendar: ['Google Calendar', 'Outlook calendar'],
-    drive: ['Google Drive', 'OneDrive'],
-    chat: ['Google Chat', 'Teams chat'],
-  };
-  const pair = names[capability];
-  if (!pair) return capability;
-  return provider === 'google' ? pair[0] : pair[1];
+  return CAPABILITY_NAMES[capability]?.[provider] ?? capability;
 }
