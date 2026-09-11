@@ -229,6 +229,13 @@ export function registerCalendarTools(server: McpServer, user: User): void {
           .optional()
           .describe('IANA timezone, e.g. Europe/Stockholm. Recommended for timed events.'),
         attendees: z.array(z.string()).optional().describe('Attendee email addresses.'),
+        optionalAttendees: z
+          .array(z.string())
+          .optional()
+          .describe(
+            'Attendee email addresses to invite as optional — invited, but marked optional ' +
+              'in the calendar client.',
+          ),
         addConference: z
           .boolean()
           .default(false)
@@ -257,6 +264,7 @@ export function registerCalendarTools(server: McpServer, user: User): void {
             end: args.end,
             timeZone: args.timeZone,
             attendees: args.attendees,
+            optionalAttendees: args.optionalAttendees,
             addConference: args.addConference,
             recurrence: args.recurrence,
           },
@@ -281,7 +289,8 @@ export function registerCalendarTools(server: McpServer, user: User): void {
         'Changes an existing event. Only the fields you provide are modified.\n\n' +
         'addAttendees and removeAttendees merge against the current guest list, so everyone ' +
         'else keeps their RSVP and any booked room stays booked; setAttendees replaces the ' +
-        'whole list. A room is an attendee, not the location field — book or release it by ' +
+        'whole list. addOptionalAttendees invites as optional, or flips an existing required ' +
+        'guest to optional without touching their RSVP. A room is an attendee, not the location field — book or release it by ' +
         'its resource address (find_rooms lists yours). location is free text and books ' +
         'nothing.\n\n' +
         'For a repeating event this changes one occurrence unless you pass applyTo:"series".',
@@ -300,6 +309,13 @@ export function registerCalendarTools(server: McpServer, user: User): void {
           .array(z.string())
           .optional()
           .describe('Addresses to invite, added to the existing guests. Rooms go here too.'),
+        addOptionalAttendees: z
+          .array(z.string())
+          .optional()
+          .describe(
+            'Addresses to invite as optional. An address already on the event as required is ' +
+              'flipped to optional — its RSVP survives.',
+          ),
         removeAttendees: z
           .array(z.string())
           .optional()
@@ -328,13 +344,17 @@ export function registerCalendarTools(server: McpServer, user: User): void {
       guard(async () => {
         const attendeeArgsGiven =
           (args.addAttendees?.length ?? 0) +
+          (args.addOptionalAttendees?.length ?? 0) +
           (args.removeAttendees?.length ?? 0) +
           (args.setAttendees ? 1 : 0);
 
-        if (args.setAttendees && (args.addAttendees?.length || args.removeAttendees?.length)) {
+        if (
+          args.setAttendees &&
+          (args.addAttendees?.length || args.addOptionalAttendees?.length || args.removeAttendees?.length)
+        ) {
           throw new ServiceError(
-            'Use either setAttendees (full replacement) or addAttendees/removeAttendees ' +
-              '(incremental), not both.',
+            'Use either setAttendees (full replacement) or addAttendees/addOptionalAttendees/' +
+              'removeAttendees (incremental), not both.',
           );
         }
 
@@ -389,7 +409,7 @@ export function registerCalendarTools(server: McpServer, user: User): void {
         }
 
         let attendeeResult:
-          | { added: string[]; removed: string[]; unchanged: number }
+          | { added: string[]; removed: string[]; madeOptional?: string[]; unchanged: number }
           | undefined;
 
         if (attendeeArgsGiven > 0) {
@@ -398,13 +418,18 @@ export function registerCalendarTools(server: McpServer, user: User): void {
             targetId,
             args.setAttendees
               ? { replace: args.setAttendees }
-              : { add: args.addAttendees, remove: args.removeAttendees },
+              : {
+                  add: args.addAttendees,
+                  addOptional: args.addOptionalAttendees,
+                  remove: args.removeAttendees,
+                },
             args.sendUpdates,
           );
           event = result.event;
           attendeeResult = {
             added: result.added,
             removed: result.removed,
+            ...(result.madeOptional.length ? { madeOptional: result.madeOptional } : {}),
             unchanged: result.unchanged,
           };
 

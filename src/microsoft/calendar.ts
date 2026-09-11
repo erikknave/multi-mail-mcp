@@ -279,6 +279,14 @@ function eventBody(input: Partial<EventInput>): Record<string, unknown> {
     }));
   }
 
+  if (input.optionalAttendees !== undefined) {
+    const optional = input.optionalAttendees.map((email) => ({
+      emailAddress: { address: email },
+      type: 'optional',
+    }));
+    body.attendees = [...((body.attendees as unknown[]) ?? []), ...optional];
+  }
+
   if (input.recurrence !== undefined) {
     if (input.recurrence === null || input.recurrence.length === 0) {
       body.recurrence = null;
@@ -446,6 +454,7 @@ export function microsoftCalendarApi(graph: Graph, accountEmail: string): Calend
       const norm = (e: string) => e.trim().toLowerCase();
       const added: string[] = [];
       const removed: string[] = [];
+      const madeOptional: string[] = [];
       let next: GraphAttendee[];
 
       if (change.replace) {
@@ -475,6 +484,22 @@ export function microsoftCalendarApi(graph: Graph, accountEmail: string): Calend
         }
       }
 
+      // Optional is applied last so it composes with add and replace alike:
+      // someone just added becomes optional in the same request, and someone
+      // already on the event is flipped rather than invited a second time.
+      for (const email of change.addOptional ?? []) {
+        const normalized = norm(email);
+        const index = next.findIndex((a) => norm(a.emailAddress?.address ?? '') === normalized);
+        if (index === -1) {
+          next.push({ emailAddress: { address: normalized }, type: 'optional' });
+          added.push(normalized);
+        } else if ((next[index]!.type ?? '').toLowerCase() !== 'optional') {
+          // The existing object is kept whole — its RSVP survives the flip.
+          next[index] = { ...next[index]!, type: 'optional' };
+          madeOptional.push(normalized);
+        }
+      }
+
       const updated = await graph.patch<GraphEvent>(
         `/me/events/${encodeURIComponent(eventId)}`,
         { attendees: next },
@@ -485,6 +510,7 @@ export function microsoftCalendarApi(graph: Graph, accountEmail: string): Calend
         event: toEventSummary(updated, accountEmail),
         added,
         removed,
+        madeOptional,
         unchanged: next.length - added.length,
       };
     },

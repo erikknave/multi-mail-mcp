@@ -68,6 +68,8 @@ export interface EventInput {
   end: string;
   timeZone?: string;
   attendees?: string[];
+  /** Attendees marked optional — invited, but shown as optional in the client. */
+  optionalAttendees?: string[];
   addConference?: boolean;
   recurrence?: string[];
 }
@@ -75,6 +77,11 @@ export interface EventInput {
 export interface AttendeeChange {
   /** Addresses to add. A room is added by its resource address, like anyone else. */
   add?: string[];
+  /**
+   * Addresses to invite as optional. An address already on the event as
+   * required is flipped to optional rather than invited twice.
+   */
+  addOptional?: string[];
   /** Addresses to remove. */
   remove?: string[];
   /** Replace the entire list. Mutually exclusive with add/remove. */
@@ -130,7 +137,14 @@ export interface CalendarApi {
     eventId: string,
     change: AttendeeChange,
     sendUpdates: SendUpdates,
-  ): Promise<{ event: EventSummary; added: string[]; removed: string[]; unchanged: number }>;
+  ): Promise<{
+    event: EventSummary;
+    added: string[];
+    removed: string[];
+    /** Existing attendees flipped to optional by addOptional. */
+    madeOptional: string[];
+    unchanged: number;
+  }>;
   freeBusy(
     calendarIds: string[],
     timeMin: string,

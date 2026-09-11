@@ -128,7 +128,14 @@ function toRequestBody(input: EventInput): calendar_v3.Schema$Event {
     ...(input.location !== undefined ? { location: input.location } : {}),
     start: toEventDateTime(input.start, input.timeZone),
     end: toEventDateTime(input.end, input.timeZone),
-    ...(input.attendees?.length ? { attendees: input.attendees.map((email) => ({ email })) } : {}),
+    ...(input.attendees?.length || input.optionalAttendees?.length
+      ? {
+          attendees: [
+            ...(input.attendees ?? []).map((email) => ({ email })),
+            ...(input.optionalAttendees ?? []).map((email) => ({ email, optional: true })),
+          ],
+        }
+      : {}),
     ...(input.recurrence?.length ? { recurrence: input.recurrence } : {}),
     ...(input.addConference
       ? {
@@ -173,7 +180,7 @@ export async function changeAttendees(
   eventId: string,
   change: AttendeeChange,
   sendUpdates: SendUpdates,
-): Promise<{ event: EventSummary; added: string[]; removed: string[]; unchanged: number }> {
+): Promise<{ event: EventSummary; added: string[]; removed: string[]; madeOptional: string[]; unchanged: number }> {
   const current = await cal.events.get({ calendarId, eventId });
   const existing = current.data.attendees ?? [];
 
@@ -181,6 +188,7 @@ export async function changeAttendees(
   let next: calendar_v3.Schema$EventAttendee[];
   const added: string[] = [];
   const removed: string[] = [];
+  const madeOptional: string[] = [];
 
   if (change.replace) {
     const wanted = change.replace.map(norm);
@@ -210,6 +218,22 @@ export async function changeAttendees(
     }
   }
 
+  // Optional is applied last so it composes with add and replace alike:
+  // someone just added becomes optional in the same request, and someone
+  // already on the event is flipped rather than invited a second time.
+  for (const email of change.addOptional ?? []) {
+    const normalized = norm(email);
+    const index = next.findIndex((a) => norm(a.email ?? '') === normalized);
+    if (index === -1) {
+      next.push({ email: normalized, optional: true });
+      added.push(normalized);
+    } else if (!next[index]!.optional) {
+      // The existing object is kept whole — its RSVP survives the flip.
+      next[index] = { ...next[index]!, optional: true };
+      madeOptional.push(normalized);
+    }
+  }
+
   const res = await cal.events.patch({
     calendarId,
     eventId,
@@ -221,6 +245,7 @@ export async function changeAttendees(
     event: toEventSummary(res.data),
     added,
     removed,
+    madeOptional,
     unchanged: next.length - added.length,
   };
 }
@@ -287,6 +312,10 @@ export async function updateEvent(
   if (input.start !== undefined) body.start = toEventDateTime(input.start, input.timeZone);
   if (input.end !== undefined) body.end = toEventDateTime(input.end, input.timeZone);
   if (input.attendees !== undefined) body.attendees = input.attendees.map((email) => ({ email }));
+  if (input.optionalAttendees !== undefined) {
+    const optional = input.optionalAttendees.map((email) => ({ email, optional: true }));
+    body.attendees = [...(body.attendees ?? []), ...optional];
+  }
   if (input.recurrence !== undefined) body.recurrence = input.recurrence;
 
   const res = await cal.events.patch({ calendarId, eventId, sendUpdates, requestBody: body });

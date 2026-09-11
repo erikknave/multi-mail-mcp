@@ -871,6 +871,70 @@ test('changeAttendees will not add someone twice', async () => {
   assert.equal(sent[0]!.responseStatus, 'accepted', 'and their RSVP survives');
 });
 
+test('addOptionalAttendees flips an existing guest and invites a new one as optional', async () => {
+  const { changeAttendees } = await import('./google/calendar.js');
+
+  const existing = [
+    { email: 'anna@example.com', responseStatus: 'accepted' },
+    { email: 'bo@example.com', responseStatus: 'accepted' },
+  ];
+  let sent: Array<Record<string, unknown>> = [];
+  const fakeCal = {
+    events: {
+      get: async () => ({ data: { attendees: existing } }),
+      patch: async (req: { requestBody: { attendees: Array<Record<string, unknown>> } }) => {
+        sent = req.requestBody.attendees;
+        return { data: { id: 'e1', attendees: req.requestBody.attendees } };
+      },
+    },
+  } as never;
+
+  const result = await changeAttendees(
+    fakeCal, 'primary', 'e1',
+    { addOptional: ['ANNA@example.com', 'cecilia@example.com'] }, 'all',
+  );
+
+  const anna = sent.find((a) => a.email === 'anna@example.com')!;
+  assert.equal(anna.optional, true, 'an existing required guest is flipped');
+  assert.equal(anna.responseStatus, 'accepted', 'and their RSVP survives the flip');
+  const cecilia = sent.find((a) => a.email === 'cecilia@example.com')!;
+  assert.deepEqual(cecilia, { email: 'cecilia@example.com', optional: true });
+  assert.equal((sent.find((a) => a.email === 'bo@example.com'))!.optional, undefined, 'nobody else is touched');
+
+  assert.deepEqual(result.madeOptional, ['anna@example.com']);
+  assert.deepEqual(result.added, ['cecilia@example.com'], 'the new invite counts as added');
+  assert.deepEqual(result.removed, []);
+
+  // Already-optional is a no-op, not re-reported as a change.
+  await changeAttendees(fakeCal, 'primary', 'e1', { addOptional: ['cecilia@example.com'] }, 'none');
+  assert.deepEqual(
+    (sent.find((a) => a.email === 'cecilia@example.com'))!,
+    { email: 'cecilia@example.com', optional: true },
+  );
+});
+
+test('createEvent marks optional attendees on the Google side', async () => {
+  const { createEvent } = await import('./google/calendar.js');
+
+  let sent: Array<Record<string, unknown>> = [];
+  const fakeCal = {
+    events: {
+      insert: async (req: { requestBody: { attendees: Array<Record<string, unknown>> } }) => {
+        sent = req.requestBody.attendees;
+        return { data: { id: 'e1', attendees: req.requestBody.attendees } };
+      },
+    },
+  } as never;
+
+  await createEvent(fakeCal, 'primary', {
+    summary: 'Genomgång', start: '2026-09-15T09:00:00+02:00', end: '2026-09-15T09:45:00+02:00',
+    attendees: ['laura@example.com'], optionalAttendees: ['annika@example.com'],
+  }, 'all');
+
+  assert.deepEqual(sent.find((a) => a.email === 'laura@example.com'), { email: 'laura@example.com' });
+  assert.deepEqual(sent.find((a) => a.email === 'annika@example.com'), { email: 'annika@example.com', optional: true });
+});
+
 test('replacing the guest list still preserves survivors', async () => {
   const { changeAttendees } = await import('./google/calendar.js');
   let sent: Array<Record<string, unknown>> = [];
@@ -1723,6 +1787,51 @@ test('an over-wide calendar range is refused with the limit named', async () => 
       maxResults: 10,
     }),
   );
+});
+
+test('Microsoft changeAttendees flips a guest to optional with their RSVP intact', async () => {
+  const { microsoftCalendarApi } = await import('./microsoft/calendar.js');
+
+  const existing = [
+    {
+      emailAddress: { address: 'anna@corp.com', name: 'Anna' },
+      type: 'required',
+      status: { response: 'accepted' },
+    },
+    { emailAddress: { address: 'bo@corp.com' }, type: 'required' },
+  ];
+  let sent: Array<Record<string, unknown>> = [];
+  const api = microsoftCalendarApi({
+    get: async () => ({ id: 'e1', attendees: existing }),
+    patch: async (_path: string, body: { attendees: Array<Record<string, unknown>> }) => {
+      sent = body.attendees;
+      return { id: 'e1', attendees: body.attendees };
+    },
+  } as never, 'me@corp.com');
+
+  const result = await api.changeAttendees(
+    'primary', 'e1',
+    { addOptional: ['Anna@Corp.com', 'cecilia@corp.com'] },
+    'all',
+  );
+
+  const anna = sent.find((a) => (a.emailAddress as { address: string }).address === 'anna@corp.com')!;
+  assert.equal(anna.type, 'optional', 'an existing required guest is flipped');
+  assert.deepEqual(anna.status, { response: 'accepted' }, 'and their RSVP survives the flip');
+  const cecilia = sent.find((a) => (a.emailAddress as { address: string }).address === 'cecilia@corp.com')!;
+  assert.deepEqual(cecilia, { emailAddress: { address: 'cecilia@corp.com' }, type: 'optional' });
+  assert.equal(
+    (sent.find((a) => (a.emailAddress as { address: string }).address === 'bo@corp.com'))!.type,
+    'required',
+    'nobody else is touched',
+  );
+
+  assert.deepEqual(result.madeOptional, ['anna@corp.com']);
+  assert.deepEqual(result.added, ['cecilia@corp.com']);
+  assert.deepEqual(result.removed, []);
+
+  const readBack = result.event.attendees.find((a) => a.email === 'anna@corp.com')!;
+  assert.equal(readBack.optional, true, 'the read mapping agrees with what was written');
 });
 
 test('a write response in a named zone is converted, not stamped with Z', async () => {

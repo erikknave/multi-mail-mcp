@@ -442,6 +442,9 @@ Events report their rooms separately (`rooms`) and flag each attendee with
 
 - `addAttendees` / `removeAttendees` change only the people you name. Everyone
   else keeps their RSVP, and any booked room stays booked.
+- `addOptionalAttendees` invites as optional, or flips an existing required
+  guest to optional without touching their RSVP — `create_event` takes
+  `optionalAttendees` for the same thing at creation.
 - `setAttendees` replaces the whole list, uninviting anyone omitted — including
   rooms. It exists for when that is genuinely the intent.
 
