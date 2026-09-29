@@ -380,6 +380,15 @@ test('toEventSummary supplies a placeholder title for untitled events', () => {
   assert.equal(e.summary, '(no title)');
 });
 
+test('a Google event reports its visibility, defaulting when unset', () => {
+  const hidden = toEventSummary({ id: 'e4', visibility: 'private' });
+  assert.equal(hidden.visibility, 'private');
+
+  // Google omits the field entirely for ordinary events.
+  const plain = toEventSummary({ id: 'e5' });
+  assert.equal(plain.visibility, 'default');
+});
+
 /* ------------------------------------------------------------------ *
  * Token refresh window
  * ------------------------------------------------------------------ */
@@ -1313,6 +1322,16 @@ test('an occurrence reports the series it belongs to', async () => {
 
   const single = toEventSummary({ id: 'one', type: 'singleInstance' }, 'me@corp.com');
   assert.equal(single.isRecurringInstance, false);
+});
+
+test('Outlook sensitivity is reported in the shared visibility vocabulary', async () => {
+  const { toEventSummary } = await import('./microsoft/calendar.js');
+
+  assert.equal(toEventSummary({ id: 'a', sensitivity: 'normal' }, 'me@corp.com').visibility, 'default');
+  assert.equal(toEventSummary({ id: 'b', sensitivity: 'private' }, 'me@corp.com').visibility, 'private');
+  // "personal" has no Google word; relabelling it would misreport, so it passes through.
+  assert.equal(toEventSummary({ id: 'c', sensitivity: 'personal' }, 'me@corp.com').visibility, 'personal');
+  assert.equal(toEventSummary({ id: 'd' }, 'me@corp.com').visibility, 'default');
 });
 
 test('a Microsoft consent URL is distinct from a Google one and cannot be replayed at it', async () => {

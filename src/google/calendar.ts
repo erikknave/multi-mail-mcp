@@ -70,6 +70,7 @@ export function toEventSummary(e: calendar_v3.Schema$Event): EventSummary {
     guestsCanModify: e.guestsCanModify ?? false,
     recurringEventId: e.recurringEventId ?? null,
     isRecurringInstance: !!e.recurringEventId,
+    visibility: e.visibility ?? 'default',
   };
 }
 
@@ -137,6 +138,7 @@ function toRequestBody(input: EventInput): calendar_v3.Schema$Event {
         }
       : {}),
     ...(input.recurrence?.length ? { recurrence: input.recurrence } : {}),
+    ...(input.visibility !== undefined ? { visibility: input.visibility } : {}),
     ...(input.addConference
       ? {
           conferenceData: {
@@ -317,6 +319,7 @@ export async function updateEvent(
     body.attendees = [...(body.attendees ?? []), ...optional];
   }
   if (input.recurrence !== undefined) body.recurrence = input.recurrence;
+  if (input.visibility !== undefined) body.visibility = input.visibility;
 
   const res = await cal.events.patch({ calendarId, eventId, sendUpdates, requestBody: body });
   return toEventSummary(res.data);

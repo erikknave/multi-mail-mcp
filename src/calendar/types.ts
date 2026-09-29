@@ -57,6 +57,12 @@ export interface EventSummary {
   /** Set when this is one occurrence of a repeating event; the id of the series. */
   recurringEventId: string | null;
   isRecurringInstance: boolean;
+  /**
+   * One vocabulary for both providers: default | public | private |
+   * confidential. Outlook's sensitivity words are mapped (normal → default);
+   * its "personal" level has no Google equivalent and passes through as-is.
+   */
+  visibility: string;
 }
 
 export interface EventInput {
@@ -72,6 +78,12 @@ export interface EventInput {
   optionalAttendees?: string[];
   addConference?: boolean;
   recurrence?: string[];
+  /**
+   * Who may see the event's details. Google takes these words directly;
+   * Outlook stores them as sensitivity, where "public" does not exist and is
+   * written as normal — the tool layer says so when that happens.
+   */
+  visibility?: 'default' | 'public' | 'private' | 'confidential';
 }
 
 export interface AttendeeChange {

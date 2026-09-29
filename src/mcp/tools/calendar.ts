@@ -42,6 +42,24 @@ function sendUpdatesNote(provider: string, sendUpdates: string): string[] {
   ];
 }
 
+const visibilityArg = z
+  .enum(['default', 'public', 'private', 'confidential'])
+  .optional()
+  .describe(
+    '"private" hides the details from anyone who can see the calendar but not the event; ' +
+      'they see only busy time. "default" follows the calendar\'s sharing settings. ' +
+      'Outlook stores this as sensitivity and has no "public" level.',
+  );
+
+/** Outlook has nothing above its default visibility, so "public" cannot be honoured. */
+function visibilityNote(provider: string, visibility: string | undefined): string[] {
+  if (provider !== 'microsoft' || visibility !== 'public') return [];
+  return [
+    'Outlook has no "public" visibility level, so the event was saved with normal ' +
+      'sensitivity (its default).',
+  ];
+}
+
 export function registerCalendarTools(server: McpServer, user: User): void {
   server.registerTool(
     'list_calendars',
@@ -244,6 +262,7 @@ export function registerCalendarTools(server: McpServer, user: User): void {
           .array(z.string())
           .optional()
           .describe('RRULE strings, e.g. ["RRULE:FREQ=WEEKLY;COUNT=10"].'),
+        visibility: visibilityArg,
         calendarId: calendarIdArg,
         sendUpdates: sendUpdatesArg,
         account: accountArg,
@@ -267,10 +286,14 @@ export function registerCalendarTools(server: McpServer, user: User): void {
             optionalAttendees: args.optionalAttendees,
             addConference: args.addConference,
             recurrence: args.recurrence,
+            visibility: args.visibility,
           },
           args.sendUpdates,
         );
-        const notes = sendUpdatesNote(acc.provider, args.sendUpdates);
+        const notes = [
+          ...sendUpdatesNote(acc.provider, args.sendUpdates),
+          ...visibilityNote(acc.provider, args.visibility),
+        ];
         return ok({
           created: true,
           account: acc.email,
@@ -328,6 +351,7 @@ export function registerCalendarTools(server: McpServer, user: User): void {
               'Prefer addAttendees/removeAttendees unless a full replacement is intended.',
           ),
         recurrence: z.array(z.string()).optional().describe('Replacement RRULE list.'),
+        visibility: visibilityArg,
         applyTo: z
           .enum(['instance', 'series'])
           .default('instance')
@@ -364,7 +388,8 @@ export function registerCalendarTools(server: McpServer, user: User): void {
           args.end !== undefined ||
           args.description !== undefined ||
           args.location !== undefined ||
-          args.recurrence !== undefined;
+          args.recurrence !== undefined ||
+          args.visibility !== undefined;
 
         if (!fieldArgsGiven && attendeeArgsGiven === 0) {
           throw new ServiceError('Nothing to change: no fields or attendee changes were given.');
@@ -389,7 +414,10 @@ export function registerCalendarTools(server: McpServer, user: User): void {
         }
 
         let event = before;
-        const notes: string[] = sendUpdatesNote(acc.provider, args.sendUpdates);
+        const notes: string[] = [
+          ...sendUpdatesNote(acc.provider, args.sendUpdates),
+          ...visibilityNote(acc.provider, args.visibility),
+        ];
 
         if (fieldArgsGiven) {
           event = await cal.updateEvent(
@@ -403,6 +431,7 @@ export function registerCalendarTools(server: McpServer, user: User): void {
               end: args.end,
               timeZone: args.timeZone,
               recurrence: args.recurrence,
+              visibility: args.visibility,
             },
             args.sendUpdates,
           );

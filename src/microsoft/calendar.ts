@@ -44,6 +44,7 @@ interface GraphEvent {
   type?: string | null;
   responseStatus?: { response?: string | null } | null;
   allowNewTimeProposals?: boolean | null;
+  sensitivity?: string | null;
 }
 
 interface GraphCalendar {
@@ -73,6 +74,27 @@ const RESPONSE_TO_GRAPH: Record<string, string> = {
 function toGoogleResponse(value: string | null | undefined): string {
   return RESPONSE_TO_GOOGLE[(value ?? '').toLowerCase()] ?? 'needsAction';
 }
+
+/**
+ * Google's visibility words as Graph sensitivity. "public" has no Outlook
+ * equivalent and becomes normal; the tool layer notes that rather than letting
+ * the caller believe something was made visible.
+ */
+const VISIBILITY_TO_GRAPH: Record<string, string> = {
+  default: 'normal',
+  public: 'normal',
+  private: 'private',
+  confidential: 'confidential',
+};
+
+/** Graph sensitivity in the shared vocabulary. "personal" passes through: it
+ * has no Google word, and relabelling it default or private would misreport. */
+const SENSITIVITY_TO_VISIBILITY: Record<string, string> = {
+  normal: 'default',
+  personal: 'personal',
+  private: 'private',
+  confidential: 'confidential',
+};
 
 /**
  * The Windows time zone names Exchange still uses in some tenants, mapped to
@@ -218,6 +240,7 @@ export function toEventSummary(e: GraphEvent, selfEmail: string): EventSummary {
     guestsCanModify: false,
     recurringEventId: e.seriesMasterId ?? null,
     isRecurringInstance: e.type === 'occurrence' || e.type === 'exception',
+    visibility: SENSITIVITY_TO_VISIBILITY[(e.sensitivity ?? '').toLowerCase()] ?? 'default',
   };
 }
 
@@ -294,6 +317,10 @@ function eventBody(input: Partial<EventInput>): Record<string, unknown> {
       const startDate = input.start ? input.start.slice(0, 10) : new Date().toISOString().slice(0, 10);
       body.recurrence = rruleToGraph(input.recurrence, startDate, input.timeZone);
     }
+  }
+
+  if (input.visibility !== undefined) {
+    body.sensitivity = VISIBILITY_TO_GRAPH[input.visibility] ?? 'normal';
   }
 
   if (input.addConference) {
