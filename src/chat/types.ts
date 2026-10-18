@@ -78,8 +78,16 @@ export interface ChatMessageSummary {
   threadTruncated?: boolean;
 }
 
+/** A file to send with a chat message, same shape as a mail attachment. */
+export interface OutgoingChatAttachment {
+  filename: string;
+  mimeType: string;
+  content: Buffer;
+}
+
 export interface OutgoingChatMessage {
-  /** Plain text. Newlines are preserved when it is sent as HTML. */
+  /** Plain text. Newlines are preserved when it is sent as HTML.
+   * May be empty when attachments carry the message. */
   body: string;
   /** Send as HTML instead of plain text, for links and simple formatting. */
   isHtml?: boolean;
@@ -88,6 +96,12 @@ export interface OutgoingChatMessage {
    * message's id. Providers without threads refuse it rather than ignoring it.
    */
   threadParentId?: string;
+  /**
+   * Files to send into the conversation. Slack uploads them; Teams refuses —
+   * its chat attachments must live in OneDrive, whose permissions this server
+   * deliberately does not hold.
+   */
+  attachments?: OutgoingChatAttachment[];
 }
 
 /**

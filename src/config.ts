@@ -194,11 +194,18 @@ export const GRAPH_SCOPE_FOR: Record<Capability, string | null> = {
  * stance the Teams chat capability takes. No bot token is requested at all.
  *
  * The `*:read` scopes list conversations, `*:history` reads them,
- * `im:write`/`mpim:write` open DMs and group DMs, and `users:read(.email)`
- * resolves member names, emails and address→user lookups. Deliberately absent:
+ * `im:write`/`mpim:write` open DMs and group DMs, `users:read(.email)`
+ * resolves member names, emails and address→user lookups, and `files:write`
+ * uploads files the user sends into a conversation. Deliberately absent:
  * `channels:write`/`groups:write` (creating or renaming channels is not
  * something this server does) and `bots:read`/`files:read` (bot senders resolve
- * to "(app)" and files are handed over as permalinks, as Teams attachments are).
+ * to "(app)" and received files are handed over as permalinks, as Teams
+ * attachments are — files:write sends, it does not read).
+ *
+ * Adding a scope here has a cost outside the code: it must also be added under
+ * "User Token Scopes" in the Slack app's OAuth settings, and every connected
+ * Slack account must re-authorise before the new calls work. Until then the
+ * server answers missing_scope with a renewal link rather than failing opaquely.
  */
 export const SLACK_SCOPES = [
   'channels:read',
@@ -214,6 +221,7 @@ export const SLACK_SCOPES = [
   'mpim:write',
   'users:read',
   'users:read.email',
+  'files:write',
 ] as const;
 
 /**

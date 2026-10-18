@@ -276,6 +276,17 @@ export function microsoftChatApi(graph: Graph, accountEmail: string): ChatApi {
     },
 
     async sendMessage(chatId, message: OutgoingChatMessage) {
+      if (message.attachments?.length) {
+        // A Teams chat attachment must first live in OneDrive and be referenced
+        // from there, which needs file permissions this server deliberately
+        // does not hold for Microsoft accounts (GRAPH_SCOPE_FOR.drive is null).
+        throw new ServiceError(
+          'Teams chats cannot take file uploads from this server: Teams attachments must be ' +
+            'placed in OneDrive first, and OneDrive access is deliberately not granted. ' +
+            'Send the file by email instead, or post a link to it.',
+        );
+      }
+
       if (!message.body.trim()) {
         throw new ServiceError('Refusing to post an empty chat message.');
       }

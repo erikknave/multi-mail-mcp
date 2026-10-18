@@ -1,11 +1,14 @@
+import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { User } from '../../db/repo.js';
+import type { OutgoingChatAttachment } from '../../chat/types.js';
 import { ReauthRequiredError } from '../../oauth/errors.js';
 import { hasCapability, providerSupports } from '../../oauth/capabilities.js';
 import { capabilityLabel, PROVIDERS } from '../../providers.js';
 import {
   chatApi,
+  getReadyUpload,
   listAccounts,
   resolveAccount,
   resolveAccounts,
@@ -338,10 +341,19 @@ export function registerChatTools(server: McpServer, user: User): void {
         `start_chat for someone you have not messaged before.\n\n` +
         `\`body\` is plain text by default; \`isHtml\` works on Teams only, since Slack ` +
         `messages are mrkdwn. \`threadTs\` replies into a Slack thread — the parent ` +
-        `message's id from read_chat; Teams chats have no threads.\n\n${CHAT_ACCOUNTS}`,
+        `message's id from read_chat; Teams chats have no threads.\n\n` +
+        `To send a file or image (Slack only): create_upload_url, have the file PUT there, ` +
+        `then pass the uploadId here — it posts as one message with \`body\` as its text. ` +
+        `Teams chats cannot take uploads from this server.\n\n${CHAT_ACCOUNTS}`,
       inputSchema: {
         chatId: z.string().describe('Chat id, from list_chats.'),
-        body: z.string().min(1).describe('Message text. Plain text unless isHtml is set.'),
+        body: z
+          .string()
+          .default('')
+          .describe(
+            'Message text. Plain text unless isHtml is set. May be empty when uploadIds ' +
+              'carry the message.',
+          ),
         isHtml: z
           .boolean()
           .default(false)
@@ -356,12 +368,34 @@ export function registerChatTools(server: McpServer, user: User): void {
             'Reply into a thread instead of the conversation: the parent message id from ' +
               'read_chat. Slack only.',
           ),
+        uploadIds: z
+          .array(z.string())
+          .optional()
+          .describe(
+            'Ids from create_upload_url whose files have already been uploaded. ' +
+              'Slack only — Teams refuses them.',
+          ),
         account: accountArg,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
-    async ({ chatId, body, isHtml, threadTs, account }) =>
+    async ({ chatId, body, isHtml, threadTs, uploadIds, account }) =>
       guard(async () => {
+        if (!body.trim() && !uploadIds?.length) {
+          throw new ServiceError('Give a body, uploadIds, or both — there is nothing to send.');
+        }
+
+        const attachments: OutgoingChatAttachment[] = await Promise.all(
+          (uploadIds ?? []).map(async (id) => {
+            const upload = getReadyUpload(user, id);
+            return {
+              filename: upload.filename,
+              mimeType: upload.mime_type,
+              content: await readFile(upload.path),
+            };
+          }),
+        );
+
         const acc = resolveChatAccount(user, account);
         const api = await chatApi(acc);
 
@@ -372,6 +406,7 @@ export function registerChatTools(server: McpServer, user: User): void {
           body,
           isHtml,
           ...(threadTs ? { threadParentId: threadTs } : {}),
+          ...(attachments.length ? { attachments } : {}),
         });
 
         return ok({
@@ -380,6 +415,9 @@ export function registerChatTools(server: McpServer, user: User): void {
           chatId,
           messageId: sent.id,
           createdAt: sent.createdAt,
+          ...(attachments.length
+            ? { filesSent: attachments.map((a) => a.filename) }
+            : {}),
           chatTopic: chat.topic,
           recipients: chat.participants.filter((p) => !p.isSelf).map((p) => p.displayName),
           wentExternal: chat.isExternal,

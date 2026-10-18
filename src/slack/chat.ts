@@ -262,6 +262,71 @@ export function slackChatApi(web: SlackWeb, accountEmail: string): ChatApi {
     };
   }
 
+  /**
+   * Sends a message that carries files, as Slack wants it done since the 2024
+   * deprecation of files.upload: reserve a presigned URL per file
+   * (files.getUploadURLExternal, which is what needs files:write), POST the
+   * bytes there, then files.completeUploadExternal shares them into the
+   * conversation with the body as the accompanying comment — one message, not
+   * a text message plus loose files.
+   */
+  async function sendWithFiles(
+    chatId: string,
+    message: OutgoingChatMessage,
+    files: NonNullable<OutgoingChatMessage['attachments']>,
+  ): Promise<{ id: string; createdAt: string }> {
+    const handles: Array<{ id: string; title: string }> = [];
+
+    for (const file of files) {
+      const slot = await web.get<{ ok?: boolean; upload_url?: string; file_id?: string }>(
+        'files.getUploadURLExternal',
+        { filename: file.filename, length: file.content.length },
+      );
+      if (!slot.upload_url || !slot.file_id) {
+        throw new ServiceError(`Slack returned no upload slot for ${file.filename}.`);
+      }
+
+      // The presigned URL is not a Web API method: no auth header, no ok-body
+      // envelope — a plain POST of the bytes, judged by HTTP status alone.
+      const put = await fetch(slot.upload_url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: new Uint8Array(file.content),
+      });
+      if (!put.ok) {
+        throw new ServiceError(
+          `Uploading ${file.filename} to Slack failed with HTTP ${put.status}.`,
+        );
+      }
+
+      handles.push({ id: slot.file_id, title: file.filename });
+    }
+
+    const completed = await web.post<{
+      ok?: boolean;
+      files?: Array<{
+        id?: string;
+        shares?: Record<string, Record<string, Array<{ ts?: string }>>>;
+      }>;
+    }>('files.completeUploadExternal', {
+      files: handles,
+      channel_id: chatId,
+      ...(message.body.trim() ? { initial_comment: message.body } : {}),
+      ...(message.threadParentId ? { thread_ts: message.threadParentId } : {}),
+    });
+
+    // The share lands as a message, but its ts is buried (and sometimes not
+    // yet present) in shares.{public|private}.{channel}[0].ts. Best effort:
+    // an empty id still means "sent", never a failure.
+    const ts = (completed.files ?? [])
+      .flatMap((f) => Object.values(f.shares ?? {}))
+      .flatMap((byChannel) => byChannel[chatId] ?? [])
+      .map((share) => share.ts)
+      .find((value): value is string => !!value);
+
+    return { id: ts ?? '', createdAt: ts ? tsToIso(ts) : '' };
+  }
+
   return {
     provider: 'slack',
     accountEmail,
@@ -407,7 +472,9 @@ export function slackChatApi(web: SlackWeb, accountEmail: string): ChatApi {
     },
 
     async sendMessage(chatId, message: OutgoingChatMessage) {
-      if (!message.body.trim()) {
+      const files = message.attachments ?? [];
+
+      if (!message.body.trim() && files.length === 0) {
         throw new ServiceError('Refusing to post an empty chat message.');
       }
 
@@ -416,6 +483,10 @@ export function slackChatApi(web: SlackWeb, accountEmail: string): ChatApi {
           'Slack messages are mrkdwn, not HTML — converting would silently drop link targets ' +
             'and formatting. Send the body as plain text or mrkdwn instead.',
         );
+      }
+
+      if (files.length > 0) {
+        return sendWithFiles(chatId, message, files);
       }
 
       // A user token posts as the member who authorised it; there is no

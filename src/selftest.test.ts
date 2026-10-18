@@ -1592,6 +1592,79 @@ test('an empty chat message is refused rather than posted', async () => {
   await assert.rejects(() => api.sendMessage('c', { body: '   ' }), /empty chat message/);
 });
 
+test('a Teams chat refuses file uploads instead of dropping them', async () => {
+  const { microsoftChatApi } = await import('./microsoft/chat.js');
+
+  const api = microsoftChatApi(stubGraph({}), 'erik@corp.com');
+  await assert.rejects(
+    () =>
+      api.sendMessage('c', {
+        body: 'här är filen',
+        attachments: [{ filename: 'a.png', mimeType: 'image/png', content: Buffer.from('x') }],
+      }),
+    /OneDrive/,
+  );
+});
+
+test('a Slack file send goes through the external upload flow as one message', async () => {
+  const { slackChatApi } = await import('./slack/chat.js');
+
+  const posted: Array<{ method: string; params: Record<string, unknown> }> = [];
+  let bytesUploaded: number | null = null;
+
+  const web = {
+    account: {} as never,
+    async get(method: string, params?: Record<string, string | number | boolean>) {
+      assert.equal(method, 'files.getUploadURLExternal');
+      assert.equal(params?.filename, 'kvitto.png');
+      return { ok: true, upload_url: 'https://files.example/up/1', file_id: 'F123' } as never;
+    },
+    async getAll() {
+      throw new Error('not expected in this test');
+    },
+    async post(method: string, params: Record<string, unknown>) {
+      posted.push({ method, params });
+      return {
+        ok: true,
+        files: [{ id: 'F123', shares: { public: { C1: [{ ts: '1760000000.000100' }] } } }],
+      } as never;
+    },
+  };
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown, init?: { body?: Uint8Array }) => {
+    assert.equal(url, 'https://files.example/up/1');
+    bytesUploaded = init?.body?.length ?? null;
+    return new Response('OK', { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const api = slackChatApi(web, 'erik@corp.com');
+    // An empty body is fine when a file carries the message.
+    const sent = await api.sendMessage('C1', {
+      body: '',
+      attachments: [{ filename: 'kvitto.png', mimeType: 'image/png', content: Buffer.from('png-bytes') }],
+    });
+
+    assert.equal(bytesUploaded, 9, 'the raw bytes must be POSTed to the presigned URL');
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0]!.method, 'files.completeUploadExternal');
+    assert.equal(posted[0]!.params.channel_id, 'C1');
+    assert.equal(
+      'initial_comment' in posted[0]!.params,
+      false,
+      'an empty body must not become an empty comment',
+    );
+    assert.deepEqual(posted[0]!.params.files, [{ id: 'F123', title: 'kvitto.png' }]);
+    assert.equal(sent.id, '1760000000.000100');
+
+    // With no file there is still nothing to send.
+    await assert.rejects(() => api.sendMessage('C1', { body: '  ' }), /empty chat message/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('HTML entities decode, including the ones Swedish mail is full of', async () => {
   const { htmlToText } = await import('./html.js');
 
