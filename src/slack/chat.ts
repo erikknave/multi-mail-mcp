@@ -302,6 +302,10 @@ export function slackChatApi(web: SlackWeb, accountEmail: string): ChatApi {
       handles.push({ id: slot.file_id, title: file.filename });
     }
 
+    // Floor for the fallback below: the share's ts can only be later than
+    // this. Generous skew, since Slack stamps with its clock, not ours.
+    const notBefore = Date.now() / 1000 - 30;
+
     const completed = await web.post<{
       ok?: boolean;
       files?: Array<{
@@ -315,14 +319,32 @@ export function slackChatApi(web: SlackWeb, accountEmail: string): ChatApi {
       ...(message.threadParentId ? { thread_ts: message.threadParentId } : {}),
     });
 
-    // The share lands as a message, but its ts is buried (and sometimes not
-    // yet present) in shares.{public|private}.{channel}[0].ts. Best effort:
-    // an empty id still means "sent", never a failure.
-    const ts = (completed.files ?? [])
+    // The share lands as a message, but its ts is buried (and often not yet
+    // present — verified live) in shares.{public|private}.{channel}[0].ts.
+    let ts = (completed.files ?? [])
       .flatMap((f) => Object.values(f.shares ?? {}))
       .flatMap((byChannel) => byChannel[chatId] ?? [])
       .map((share) => share.ts)
       .find((value): value is string => !!value);
+
+    // Fallback: read the newest message back. The share takes a moment to
+    // appear in history (verified live: the first read returned the PREVIOUS
+    // message), so poll briefly and accept only a ts from after this send —
+    // handing back some older message's id would be worse than handing back
+    // none. Best effort throughout: an empty id still means "sent".
+    for (let attempt = 0; !ts && attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 600));
+      try {
+        const history = await web.get<{ messages?: SlackMessage[] }>('conversations.history', {
+          channel: chatId,
+          limit: 1,
+        });
+        const latest = history.messages?.[0]?.ts;
+        if (latest && Number(latest) >= notBefore) ts = latest;
+      } catch {
+        break; // the upload already succeeded; reporting it matters more than the id
+      }
+    }
 
     return { id: ts ?? '', createdAt: ts ? tsToIso(ts) : '' };
   }
