@@ -72,8 +72,23 @@ function instructionsFor(user: User, available: Set<Capability>): string {
     "Gmail's; see the search_drive description.\n\n" +
     'Spreadsheets and Google Docs must be edited with their own tools. Never use ' +
     'write_drive_file on one: it replaces the entire file, destroying every other tab of a ' +
-    'workbook. Use write_sheet_range and append_to_doc instead, and duplicate_sheet_tab to ' +
+    'workbook. Use write_sheet_range and the Docs tools instead, and duplicate_sheet_tab to ' +
     'copy a tab with its formatting intact.\n\n' +
+    (available.has('drive')
+      ? 'Google Docs: documents can have several tabs. read_doc reads all of them and ' +
+        'returns a revisionId; every write takes an optional tabId and requiredRevisionId ' +
+        '(pass the revisionId you read so a concurrent edit by someone else is refused ' +
+        'instead of overwritten) and returns the new revisionId. To add text in the middle, ' +
+        'use insert_doc_text with an anchor from the paragraph before; to remove ' +
+        'paragraphs, delete_doc_text — not replace_doc_text with newlines or "". Inserted ' +
+        'and appended text is Markdown-lite: one line per paragraph, # headings, - and 1. ' +
+        'lists, **bold**, *italic*, ~~strike~~, [link](url); a line ending in \\ (or a ' +
+        '\\v character) gives a soft line break inside the paragraph. Copy search text from ' +
+        'read_doc, not from a Markdown export: list numbers are not text. format_doc_text ' +
+        'marks existing text (e.g. strikethrough + colour for a correction). Comments: ' +
+        'list_doc_comments, add_doc_comment (never anchored to a text range — the API ' +
+        'cannot), reply_to_doc_comment, resolve_doc_comment.\n\n'
+      : '') +
     'Results that span several accounts carry an `incomplete` flag. When it is true, some ' +
     'account could not be read: say so rather than reporting the result as complete, and ' +
     'never conclude that something is absent from an account you could not reach.\n\n' +
