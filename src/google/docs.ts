@@ -1,74 +1,432 @@
 import { google, type docs_v1 } from 'googleapis';
 import type { OAuth2Client } from 'google-auth-library';
+import { ServiceError } from '../serviceError.js';
+import {
+  appendPlan,
+  buildInsertRequests,
+  findMatches,
+  flattenTabs,
+  indexedText,
+  listParagraphs,
+  noMatchHints,
+  normalizeDeletes,
+  paragraphDeleteRanges,
+  paragraphsIn,
+  tabText,
+  type Block,
+  type DeleteRange,
+  type ParagraphInfo,
+  type TabInfo,
+  type TextMatch,
+} from './docsModel.js';
+import { hexToColor } from './sheets.js';
 
 export function docsFor(auth: OAuth2Client): docs_v1.Docs {
   return google.docs({ version: 'v1', auth });
 }
 
-export interface DocInfo {
-  documentId: string;
-  title: string;
-  /** Character index one past the last content element. */
-  endIndex: number;
-  text: string;
+/* ------------------------------------------------------------------ *
+ * Reading
+ * ------------------------------------------------------------------ */
+
+/**
+ * Always with includeTabsContent: without it the API returns only the first
+ * tab, silently, and anything in another tab looks absent.
+ */
+export async function getDocument(
+  docs: docs_v1.Docs,
+  documentId: string,
+): Promise<docs_v1.Schema$Document> {
+  const res = await docs.documents.get({ documentId, includeTabsContent: true });
+  return res.data;
 }
 
-function extractText(body: docs_v1.Schema$Body | undefined): string {
-  let out = '';
-  for (const element of body?.content ?? []) {
-    for (const run of element.paragraph?.elements ?? []) {
-      out += run.textRun?.content ?? '';
-    }
-    // Table cells hold their own nested paragraphs.
-    for (const row of element.table?.tableRows ?? []) {
-      for (const cell of row.tableCells ?? []) {
-        for (const cellElement of cell.content ?? []) {
-          for (const run of cellElement.paragraph?.elements ?? []) {
-            out += run.textRun?.content ?? '';
-          }
-        }
-      }
-    }
+export function describeTabs(tabs: TabInfo[]) {
+  return tabs.map((t) => ({
+    tabId: t.tabId,
+    title: t.title,
+    index: t.index,
+    depth: t.depth,
+    ...(t.parentTabId ? { parentTabId: t.parentTabId } : {}),
+    characterCount: tabText(t).length,
+  }));
+}
+
+/** The named tab, or the first one. An unknown id lists the real ones. */
+export function pickTab(tabs: TabInfo[], tabId?: string): TabInfo {
+  if (!tabId) return tabs[0]!;
+  const tab = tabs.find((t) => t.tabId === tabId);
+  if (!tab) {
+    throw new ServiceError(
+      `This document has no tab "${tabId}". Its tabs are: ` +
+        tabs.map((t) => `${t.tabId} ("${t.title}")`).join(', ') +
+        '.',
+    );
   }
-  return out;
+  return tab;
+}
+
+/* ------------------------------------------------------------------ *
+ * Writing, with the revision guard
+ * ------------------------------------------------------------------ */
+
+export interface WriteResult {
+  revisionId: string | null;
+  replies: docs_v1.Schema$Response[];
+}
+
+function isRevisionMismatch(err: unknown): boolean {
+  return /does not match the latest revision/i.test((err as { message?: string })?.message ?? '');
+}
+
+function staleError(required: string): ServiceError {
+  return new ServiceError(
+    `REVISION MISMATCH — the document has changed since revision ${required}, so nothing ` +
+      'was written. Someone else (or another edit of yours) got there first. Call read_doc ' +
+      'again, check that your change still makes sense against the current text, then ' +
+      'retry with the new revisionId.',
+  );
+}
+
+export async function batch(
+  docs: docs_v1.Docs,
+  documentId: string,
+  requests: docs_v1.Schema$Request[],
+  requiredRevisionId?: string,
+): Promise<WriteResult> {
+  try {
+    const res = await docs.documents.batchUpdate({
+      documentId,
+      requestBody: {
+        requests,
+        ...(requiredRevisionId ? { writeControl: { requiredRevisionId } } : {}),
+      },
+    });
+    return {
+      revisionId: res.data.writeControl?.requiredRevisionId ?? null,
+      replies: res.data.replies ?? [],
+    };
+  } catch (err) {
+    if (requiredRevisionId && isRevisionMismatch(err)) throw staleError(requiredRevisionId);
+    throw err;
+  }
 }
 
 /**
- * The last content element's endIndex points just past the document's final
- * newline. Inserting there is rejected, so text must go one index earlier —
- * the single most common way Docs API insertions fail.
+ * Read, compute index-based requests, write — with the write pinned to the
+ * revision that was read. Indices computed from a document that has since
+ * changed would land in the wrong place, which is worse than failing. If the
+ * caller supplied no revision of their own, a lost race is retried once on a
+ * fresh read; if they did, it is reported, because their intent was based on
+ * text that is no longer there.
  */
-function insertionIndex(doc: docs_v1.Schema$Document): number {
-  const content = doc.body?.content ?? [];
-  const last = content[content.length - 1];
-  const end = last?.endIndex ?? 1;
-  return Math.max(1, end - 1);
+async function readModifyWrite<T>(
+  docs: docs_v1.Docs,
+  documentId: string,
+  requiredRevisionId: string | undefined,
+  plan: (doc: docs_v1.Schema$Document) => { requests: docs_v1.Schema$Request[]; result: T },
+): Promise<T & { revisionId: string | null }> {
+  for (let attempt = 0; ; attempt++) {
+    const doc = await getDocument(docs, documentId);
+    if (requiredRevisionId && doc.revisionId !== requiredRevisionId) {
+      throw staleError(requiredRevisionId);
+    }
+    const { requests, result } = plan(doc);
+    try {
+      const written = await batch(docs, documentId, requests, doc.revisionId ?? undefined);
+      return { ...result, revisionId: written.revisionId };
+    } catch (err) {
+      const raced = err instanceof ServiceError && err.message.startsWith('REVISION MISMATCH');
+      if (raced && !requiredRevisionId && attempt === 0) continue;
+      throw err;
+    }
+  }
 }
 
-export async function readDoc(docs: docs_v1.Docs, documentId: string): Promise<DocInfo> {
-  const res = await docs.documents.get({ documentId });
-  const content = res.data.body?.content ?? [];
+/* ------------------------------------------------------------------ *
+ * Locating text
+ * ------------------------------------------------------------------ */
+
+export interface Located {
+  tab: TabInfo;
+  match: TextMatch;
+  paragraphs: ParagraphInfo[];
+  all: ParagraphInfo[];
+}
+
+export interface LocateOptions {
+  tabId?: string;
+  matchCase?: boolean;
+  /** 1-based; required when the text occurs more than once, unless `all`. */
+  occurrence?: number;
+  all?: boolean;
+}
+
+function snippet(p: ParagraphInfo | undefined): string {
+  const t = (p?.text ?? '').replace(/\n$/, '').replace(/\v/g, ' ');
+  return t.length > 80 ? `${t.slice(0, 77)}...` : t;
+}
+
+/**
+ * Finds text in one tab or all of them. Exact first; only if that finds
+ * nothing, again treating look-alike characters as equal (curly vs straight
+ * quotes, … vs ..., dashes, non-breaking spaces, soft vs hard line breaks) —
+ * flagged as `loose` so the caller can see what actually matched.
+ */
+export function locate(
+  doc: docs_v1.Schema$Document,
+  needle: string,
+  opts: LocateOptions,
+): { found: Located[]; loose: boolean; total: number } {
+  const tabs = flattenTabs(doc);
+  const scope = opts.tabId ? [pickTab(tabs, opts.tabId)] : tabs;
+
+  const search = (loose: boolean): Located[] =>
+    scope.flatMap((tab) => {
+      const all = listParagraphs(tab);
+      const hay = indexedText(all);
+      return findMatches(hay, needle, { matchCase: opts.matchCase, loose }).map((match) => ({
+        tab,
+        match,
+        paragraphs: paragraphsIn(all, match.startIndex, match.endIndex),
+        all,
+      }));
+    });
+
+  let loose = false;
+  let found = search(false);
+  if (found.length === 0) {
+    found = search(true);
+    loose = found.length > 0;
+  }
+
+  const where = opts.tabId ? 'in that tab' : 'in any tab';
+  if (found.length === 0) {
+    const hints = noMatchHints(needle);
+    throw new ServiceError(
+      `"${needle}" was not found ${where}, not even ignoring quote, dash and ellipsis ` +
+        `variants. Nothing was changed.${hints.length ? ` ${hints.join(' ')}` : ''}`,
+    );
+  }
+
+  const total = found.length;
+  if (opts.all) return { found, loose, total };
+  if (opts.occurrence) {
+    const one = found[opts.occurrence - 1];
+    if (!one) {
+      throw new ServiceError(
+        `Only ${total} occurrence(s) of "${needle}" exist ${where}; occurrence ` +
+          `${opts.occurrence} does not. Nothing was changed.`,
+      );
+    }
+    return { found: [one], loose, total };
+  }
+  if (total > 1) {
+    const list = found
+      .slice(0, 6)
+      .map((f, i) => `${i + 1}) [${f.tab.title}] "${snippet(f.paragraphs[0])}"`)
+      .join('; ');
+    throw new ServiceError(
+      `AMBIGUOUS — "${needle}" occurs ${total} times ${where}: ${list}${total > 6 ? '; …' : ''}. ` +
+        'Nothing was changed. Pass occurrence (1-based, in document order), a longer ' +
+        'search text, a tabId, or all: true.',
+    );
+  }
+  return { found, loose, total };
+}
+
+function describeMatch(l: Located) {
   return {
-    documentId: res.data.documentId ?? documentId,
-    title: res.data.title ?? '(untitled)',
-    endIndex: content[content.length - 1]?.endIndex ?? 1,
-    text: extractText(res.data.body),
+    tabId: l.tab.tabId,
+    tabTitle: l.tab.title,
+    startIndex: l.match.startIndex,
+    endIndex: l.match.endIndex,
+    matchedText: l.match.text,
   };
 }
 
-export async function appendText(
+/* ------------------------------------------------------------------ *
+ * Operations
+ * ------------------------------------------------------------------ */
+
+export interface WriteOptions {
+  tabId?: string;
+  requiredRevisionId?: string;
+}
+
+export async function appendBlocks(
   docs: docs_v1.Docs,
   documentId: string,
-  text: string,
-): Promise<number> {
-  const doc = await docs.documents.get({ documentId, fields: 'body.content.endIndex' });
-  const index = insertionIndex(doc.data);
-
-  await docs.documents.batchUpdate({
-    documentId,
-    requestBody: { requests: [{ insertText: { location: { index }, text } }] },
+  blocks: Block[],
+  opts: WriteOptions,
+) {
+  return readModifyWrite(docs, documentId, opts.requiredRevisionId, (doc) => {
+    const tab = pickTab(flattenTabs(doc), opts.tabId);
+    const plan = appendPlan(listParagraphs(tab), tab.tabId || undefined);
+    const built = buildInsertRequests(blocks, plan);
+    return {
+      requests: built.requests,
+      result: { tabId: tab.tabId, tabTitle: tab.title, paragraphsAdded: built.paragraphs },
+    };
   });
-  return text.length;
+}
+
+export async function insertAtAnchor(
+  docs: docs_v1.Docs,
+  documentId: string,
+  anchor: string,
+  blocks: Block[],
+  opts: WriteOptions &
+    Omit<LocateOptions, 'all'> & { position: 'after' | 'before'; inheritStyle?: boolean },
+) {
+  return readModifyWrite(docs, documentId, opts.requiredRevisionId, (doc) => {
+    const { found, loose, total } = locate(doc, anchor, { ...opts, all: false });
+    const hit = found[0]!;
+    const tabId = hit.tab.tabId || undefined;
+    // An anchor spanning paragraphs: insert after the last one it touches, or
+    // before the first.
+    const para =
+      opts.position === 'after' ? hit.paragraphs[hit.paragraphs.length - 1]! : hit.paragraphs[0]!;
+    const plan =
+      opts.position === 'after'
+        ? { index: para.endIndex - 1, prefix: '\n' as const, suffix: '' as const, tabId }
+        : { index: para.startIndex, prefix: '' as const, suffix: '\n' as const, tabId };
+    const built = buildInsertRequests(blocks, { ...plan, inheritStyle: opts.inheritStyle });
+    return {
+      requests: built.requests,
+      result: {
+        anchor: { ...describeMatch(hit), paragraph: snippet(para), occurrencesOfAnchor: total },
+        ...(loose ? { matchedLoosely: true } : {}),
+        paragraphsAdded: built.paragraphs,
+      },
+    };
+  });
+}
+
+export async function deleteText(
+  docs: docs_v1.Docs,
+  documentId: string,
+  find: string,
+  opts: WriteOptions & LocateOptions & { mode: 'paragraph' | 'text' },
+) {
+  return readModifyWrite(docs, documentId, opts.requiredRevisionId, (doc) => {
+    const { found, loose, total } = locate(doc, find, opts);
+    const requests: docs_v1.Schema$Request[] = [];
+    const deleted: Array<{ tabTitle: string; text: string }> = [];
+    let leftEmpty = 0;
+
+    // Grouped per tab: deleting in one tab never shifts another tab's indices.
+    const byTab = new Map<TabInfo, Located[]>();
+    for (const f of found) byTab.set(f.tab, [...(byTab.get(f.tab) ?? []), f]);
+
+    for (const [tab, hits] of byTab) {
+      let ranges: DeleteRange[];
+      if (opts.mode === 'paragraph') {
+        const selected = [
+          ...new Map(hits.flatMap((h) => h.paragraphs).map((p) => [p.startIndex, p])).values(),
+        ];
+        const computed = paragraphDeleteRanges(selected, hits[0]!.all);
+        leftEmpty += computed.filter((r) => r.leavesEmptyParagraph).length;
+        ranges = computed;
+        for (const p of selected) deleted.push({ tabTitle: tab.title, text: snippet(p) });
+      } else {
+        ranges = hits.map((h) => ({ startIndex: h.match.startIndex, endIndex: h.match.endIndex }));
+        for (const h of hits) deleted.push({ tabTitle: tab.title, text: h.match.text });
+      }
+      for (const r of normalizeDeletes(ranges)) {
+        requests.push({
+          deleteContentRange: {
+            range: {
+              startIndex: r.startIndex,
+              endIndex: r.endIndex,
+              ...(tab.tabId ? { tabId: tab.tabId } : {}),
+            },
+          },
+        });
+      }
+    }
+
+    return {
+      requests,
+      result: {
+        occurrencesFound: total,
+        deleted,
+        ...(loose ? { matchedLoosely: true } : {}),
+        ...(leftEmpty
+          ? {
+              note:
+                `${leftEmpty} paragraph(s) were emptied rather than removed: the API cannot ` +
+                'remove the only paragraph of a table cell or document, or the line right ' +
+                'before a table.',
+            }
+          : {}),
+      },
+    };
+  });
+}
+
+export interface TextFormat {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strikethrough?: boolean;
+  /** Hex, e.g. #d93025. Empty string clears it. */
+  color?: string;
+  /** Hex background, e.g. #fff475. Empty string clears it. */
+  highlight?: string;
+}
+
+export function textStyleFor(f: TextFormat): { textStyle: docs_v1.Schema$TextStyle; fields: string } {
+  const textStyle: docs_v1.Schema$TextStyle = {};
+  const fields: string[] = [];
+  for (const key of ['bold', 'italic', 'underline', 'strikethrough'] as const) {
+    if (f[key] !== undefined) {
+      textStyle[key] = f[key];
+      fields.push(key);
+    }
+  }
+  const colour = (hex: string) => ({ color: { rgbColor: hexToColor(hex) } });
+  if (f.color !== undefined) {
+    if (f.color) textStyle.foregroundColor = colour(f.color);
+    fields.push('foregroundColor');
+  }
+  if (f.highlight !== undefined) {
+    if (f.highlight) textStyle.backgroundColor = colour(f.highlight);
+    fields.push('backgroundColor');
+  }
+  return { textStyle, fields: fields.join(',') };
+}
+
+export async function formatText(
+  docs: docs_v1.Docs,
+  documentId: string,
+  find: string,
+  format: TextFormat,
+  opts: WriteOptions & LocateOptions,
+) {
+  const { textStyle, fields } = textStyleFor(format);
+  if (!fields) throw new ServiceError('No formatting was given — set at least one property.');
+  return readModifyWrite(docs, documentId, opts.requiredRevisionId, (doc) => {
+    const { found, loose, total } = locate(doc, find, opts);
+    return {
+      requests: found.map((f) => ({
+        updateTextStyle: {
+          range: {
+            startIndex: f.match.startIndex,
+            endIndex: f.match.endIndex,
+            ...(f.tab.tabId ? { tabId: f.tab.tabId } : {}),
+          },
+          textStyle,
+          fields,
+        },
+      })),
+      result: {
+        occurrencesFound: total,
+        formatted: found.map(describeMatch),
+        ...(loose ? { matchedLoosely: true } : {}),
+      },
+    };
+  });
 }
 
 export async function replaceText(
@@ -77,64 +435,82 @@ export async function replaceText(
   find: string,
   replace: string,
   matchCase: boolean,
-): Promise<number> {
-  const res = await docs.documents.batchUpdate({
+  opts: WriteOptions,
+): Promise<{ occurrencesChanged: number; revisionId: string | null }> {
+  const res = await batch(
+    docs,
     documentId,
-    requestBody: {
-      requests: [{ replaceAllText: { containsText: { text: find, matchCase }, replaceText: replace } }],
-    },
-  });
-  return res.data.replies?.[0]?.replaceAllText?.occurrencesChanged ?? 0;
+    [
+      {
+        replaceAllText: {
+          containsText: { text: find, matchCase },
+          replaceText: replace,
+          // Without tabsCriteria the replacement runs in every tab.
+          ...(opts.tabId ? { tabsCriteria: { tabIds: [opts.tabId] } } : {}),
+        },
+      },
+    ],
+    opts.requiredRevisionId,
+  );
+  return {
+    occurrencesChanged: res.replies[0]?.replaceAllText?.occurrencesChanged ?? 0,
+    revisionId: res.revisionId,
+  };
 }
 
-export type HeadingLevel = 1 | 2 | 3 | 4 | 5 | 6;
-
-/**
- * Appends a heading. The text and its paragraph style are applied in one batch
- * so the document is never briefly left with an unstyled paragraph.
- */
-export async function appendHeading(
+export async function addTab(
   docs: docs_v1.Docs,
   documentId: string,
-  text: string,
-  level: HeadingLevel,
-): Promise<void> {
-  const doc = await docs.documents.get({ documentId, fields: 'body.content.endIndex' });
-  const index = insertionIndex(doc.data);
-  const withNewline = `${text}\n`;
-
-  await docs.documents.batchUpdate({
-    documentId,
-    requestBody: {
-      requests: [
-        { insertText: { location: { index }, text: withNewline } },
-        {
-          updateParagraphStyle: {
-            range: { startIndex: index, endIndex: index + withNewline.length },
-            paragraphStyle: { namedStyleType: `HEADING_${level}` },
-            fields: 'namedStyleType',
-          },
-        },
-      ],
+  opts: { title?: string; parentTabId?: string; index?: number; requiredRevisionId?: string },
+): Promise<{ tabId: string; title: string; index: number | null; revisionId: string | null }> {
+  // addDocumentTab postdates the googleapis typings this project pins, hence the cast.
+  const request = {
+    addDocumentTab: {
+      tabProperties: {
+        ...(opts.title ? { title: opts.title } : {}),
+        ...(opts.parentTabId ? { parentTabId: opts.parentTabId } : {}),
+        ...(opts.index !== undefined ? { index: opts.index } : {}),
+      },
     },
-  });
+  } as docs_v1.Schema$Request;
+  const res = await batch(docs, documentId, [request], opts.requiredRevisionId);
+  const reply = (
+    res.replies[0] as { addDocumentTab?: { tabProperties?: docs_v1.Schema$TabProperties } }
+  )?.addDocumentTab?.tabProperties;
+  if (!reply?.tabId) throw new Error('Google did not return the new tab id');
+  return {
+    tabId: reply.tabId,
+    title: reply.title ?? opts.title ?? '',
+    index: reply.index ?? null,
+    revisionId: res.revisionId,
+  };
+}
+
+/** Fills a tab that was just created and so holds one empty paragraph. */
+export async function fillNewTab(
+  docs: docs_v1.Docs,
+  documentId: string,
+  tabId: string,
+  blocks: Block[],
+): Promise<string | null> {
+  const built = buildInsertRequests(blocks, { index: 1, prefix: '', suffix: '', tabId });
+  return (await batch(docs, documentId, built.requests)).revisionId;
 }
 
 export async function createDoc(
   docs: docs_v1.Docs,
   title: string,
-  initialText?: string,
-): Promise<DocInfo> {
+  blocks?: Block[],
+): Promise<{ documentId: string; title: string; revisionId: string | null }> {
   const created = await docs.documents.create({ requestBody: { title } });
   const documentId = created.data.documentId;
   if (!documentId) throw new Error('Google did not return a document id');
 
-  if (initialText) {
-    await docs.documents.batchUpdate({
-      documentId,
-      requestBody: { requests: [{ insertText: { location: { index: 1 }, text: initialText } }] },
-    });
+  let revisionId = created.data.revisionId ?? null;
+  if (blocks && blocks.length > 0) {
+    // A new document is a single empty paragraph: fill it.
+    const built = buildInsertRequests(blocks, { index: 1, prefix: '', suffix: '' });
+    revisionId = (await batch(docs, documentId, built.requests)).revisionId;
   }
-
-  return readDoc(docs, documentId);
+  return { documentId, title: created.data.title ?? title, revisionId };
 }

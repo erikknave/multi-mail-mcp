@@ -728,25 +728,373 @@ test('a spreadsheet is never written through the Drive blob path', async () => {
  * Docs
  * ------------------------------------------------------------------ */
 
-test('appending to a Doc inserts before the final newline', async () => {
-  // Inserting at the reported endIndex is rejected by the API; it must be one
-  // less. This is the most common Docs insertion failure.
-  const source = await readFile(new URL('./google/docs.ts', import.meta.url), 'utf8');
-  assert.match(source, /end - 1/, 'insertion index must step back off the trailing newline');
-  assert.match(source, /Math\.max\(1,/, 'index must never fall below 1');
+// A paragraph element as the Docs API returns it.
+function para(start: number, text: string, extra: Record<string, unknown> = {}) {
+  return {
+    startIndex: start,
+    endIndex: start + text.length,
+    paragraph: {
+      elements: [{ startIndex: start, endIndex: start + text.length, textRun: { content: text } }],
+      paragraphStyle: { namedStyleType: 'NORMAL_TEXT' },
+      ...extra,
+    },
+  };
+}
+
+/** A body of consecutive paragraphs starting at index 1, after the section break. */
+function bodyOf(...texts: string[]) {
+  const content: unknown[] = [{ endIndex: 1, sectionBreak: {} }];
+  let at = 1;
+  for (const t of texts) {
+    content.push(para(at, t));
+    at += t.length;
+  }
+  return { content } as never;
+}
+
+test('every tab is read, children nested under their parent, in document order', async () => {
+  const { flattenTabs } = await import('./google/docsModel.js');
+  const doc = {
+    title: 'D',
+    tabs: [
+      {
+        tabProperties: { tabId: 't.0', title: 'Ett', index: 0 },
+        documentTab: { body: bodyOf('a\n') },
+        childTabs: [
+          {
+            tabProperties: { tabId: 't.c', title: 'Barn', index: 0, parentTabId: 't.0' },
+            documentTab: { body: bodyOf('b\n') },
+            childTabs: [
+              { tabProperties: { tabId: 't.cc', title: 'Barnbarn', index: 0 }, documentTab: {} },
+            ],
+          },
+        ],
+      },
+      { tabProperties: { tabId: 't.2', title: 'Två', index: 1 }, documentTab: { body: bodyOf('c\n') } },
+    ],
+  };
+  const tabs = flattenTabs(doc as never);
+  assert.deepEqual(
+    tabs.map((t) => [t.tabId, t.depth, t.parentTabId]),
+    [
+      ['t.0', 0, null],
+      ['t.c', 1, 't.0'],
+      ['t.cc', 2, 't.c'],
+      ['t.2', 0, null],
+    ],
+  );
 });
 
-test('a heading is inserted and styled in a single batch', async () => {
+test('a document fetched without tabs content is still one readable tab', async () => {
+  const { flattenTabs, tabText } = await import('./google/docsModel.js');
+  const tabs = flattenTabs({ title: 'Old', body: bodyOf('hej\n') } as never);
+  assert.equal(tabs.length, 1);
+  assert.equal(tabText(tabs[0]!), 'hej\n');
+});
+
+test('documents are always fetched with every tab', async () => {
+  // Without includeTabsContent the API silently returns only the first tab —
+  // the reason read_doc used to miss everything in tab 2.
   const source = await readFile(new URL('./google/docs.ts', import.meta.url), 'utf8');
-  const batch = /appendHeading[\s\S]*?\n}/.exec(source);
-  assert.ok(batch);
-  assert.match(batch[0], /insertText/);
-  assert.match(batch[0], /namedStyleType/, 'a real heading style, not just bold text');
-  assert.equal(
-    (batch[0].match(/batchUpdate/g) ?? []).length,
-    1,
-    'one batch, so the document is never left with an unstyled paragraph',
+  assert.match(source, /includeTabsContent: true/);
+  assert.doesNotMatch(source, /documents\.get\(\{ documentId(, fields: [^}]*)? \}\)/);
+});
+
+test('indexed text puts every character at its document index, tables and objects included', async () => {
+  const { listParagraphs, indexedText, OBJECT_CHAR } = await import('./google/docsModel.js');
+  const body = {
+    content: [
+      { endIndex: 1, sectionBreak: {} },
+      {
+        startIndex: 1,
+        endIndex: 5,
+        paragraph: {
+          elements: [
+            { startIndex: 1, endIndex: 3, textRun: { content: 'ab' } },
+            { startIndex: 3, endIndex: 4, inlineObjectElement: {} },
+            { startIndex: 4, endIndex: 5, textRun: { content: '\n' } },
+          ],
+        },
+      },
+      {
+        startIndex: 5,
+        endIndex: 12,
+        table: {
+          tableRows: [{ tableCells: [{ content: [para(7, 'cell\n')] }] }],
+        },
+      },
+      para(12, 'efter\n'),
+    ],
+  };
+  const paragraphs = listParagraphs({ body } as never);
+  assert.deepEqual(
+    paragraphs.map((p) => [p.startIndex, p.container, p.next]),
+    [
+      [1, 'body', 'table'],
+      [7, 'cell0', null],
+      [12, 'body', null],
+    ],
   );
+  const flat = indexedText(paragraphs);
+  assert.equal(flat.slice(1, 5), `ab${OBJECT_CHAR}\n`);
+  assert.equal(flat.slice(7, 12), 'cell\n');
+  assert.equal(flat.slice(12), 'efter\n');
+  assert.equal(flat[5], '\u0000', 'table markers hold no text');
+});
+
+test('list items know whether their list is numbered', async () => {
+  const { listParagraphs } = await import('./google/docsModel.js');
+  const body = {
+    content: [
+      para(1, 'ett\n', { bullet: { listId: 'L1' } }),
+      para(5, 'två\n', { bullet: { listId: 'L2', nestingLevel: 1 } }),
+    ],
+  };
+  const lists = {
+    L1: { listProperties: { nestingLevels: [{ glyphType: 'DECIMAL' }] } },
+    L2: { listProperties: { nestingLevels: [{ glyphSymbol: '●' }, { glyphSymbol: '○' }] } },
+  };
+  const [a, b] = listParagraphs({ body, lists } as never);
+  assert.deepEqual(a!.list, { listId: 'L1', nestingLevel: 0, ordered: true });
+  assert.deepEqual(b!.list, { listId: 'L2', nestingLevel: 1, ordered: false });
+});
+
+test('exact search finds every occurrence at its document index', async () => {
+  const { findMatches } = await import('./google/docsModel.js');
+  const m = findMatches('\u0000Hej hej\nhej', 'hej');
+  assert.deepEqual(m.map((x) => x.startIndex), [5, 9]);
+  assert.equal(findMatches('\u0000Hej hej', 'hej', { matchCase: false }).length, 2);
+  assert.equal(findMatches('a.b', '.').length, 1, 'regex characters are literal');
+});
+
+test('loose search bridges the look-alikes Docs autocorrects', async () => {
+  const { findMatches } = await import('./google/docsModel.js');
+  const doc = 'Det är Eriks ’test’ och “citat” – med\u00a0nbsp, sen…slut\vrad';
+  for (const needle of ["Eriks 'test'", '"citat" - med nbsp', 'sen...slut', 'slut\nrad']) {
+    assert.equal(findMatches(doc, needle).length, 0, `exact should miss ${needle}`);
+    const [m] = findMatches(doc, needle, { loose: true });
+    assert.ok(m, `loose should find ${needle}`);
+    assert.equal(doc.slice(m.startIndex, m.endIndex), m.text);
+  }
+  // And the other way round: the document has "...", the caller typed "…".
+  assert.equal(findMatches('vänta...nu', 'vänta…nu', { loose: true })[0]?.text, 'vänta...nu');
+});
+
+test('a fruitless search explains list numbers and Markdown-export artefacts', async () => {
+  const { noMatchHints } = await import('./google/docsModel.js');
+  assert.match(noMatchHints('1. Första punkt').join(' '), /List numbers/);
+  assert.match(noMatchHints('slut  \nnästa').join(' '), /Markdown export/);
+  assert.match(noMatchHints('a\nb').join(' '), /line break/);
+  assert.deepEqual(noMatchHints('vanlig text'), []);
+});
+
+test('deleting a paragraph removes its newline so no empty line is left', async () => {
+  const { listParagraphs, paragraphDeleteRanges } = await import('./google/docsModel.js');
+  const all = listParagraphs({ body: bodyOf('ett\n', 'två\n', 'tre\n') } as never);
+  assert.deepEqual(paragraphDeleteRanges([all[1]!], all), [
+    { startIndex: 5, endIndex: 9, leavesEmptyParagraph: false },
+  ]);
+});
+
+test('deleting the last paragraph joins it onto the previous one', async () => {
+  // Its newline is the body's last and cannot be deleted; removing the
+  // previous paragraph's newline instead keeps the previous paragraph's style.
+  const { listParagraphs, paragraphDeleteRanges } = await import('./google/docsModel.js');
+  const all = listParagraphs({ body: bodyOf('ett\n', 'två\n', 'tre\n') } as never);
+  assert.deepEqual(paragraphDeleteRanges([all[2]!], all), [
+    { startIndex: 8, endIndex: 12, leavesEmptyParagraph: false },
+  ]);
+  // The last two together are one block, not two ranges that leave a blank.
+  assert.deepEqual(paragraphDeleteRanges([all[1]!, all[2]!], all), [
+    { startIndex: 4, endIndex: 12, leavesEmptyParagraph: false },
+  ]);
+});
+
+test('a paragraph that cannot be removed is emptied and says so', async () => {
+  const { listParagraphs, paragraphDeleteRanges } = await import('./google/docsModel.js');
+  const only = listParagraphs({ body: bodyOf('ensam\n') } as never);
+  assert.deepEqual(paragraphDeleteRanges(only, only), [
+    { startIndex: 1, endIndex: 6, leavesEmptyParagraph: true },
+  ]);
+  const beforeTable = listParagraphs({
+    body: {
+      content: [
+        para(1, 'före\n'),
+        { startIndex: 6, endIndex: 14, table: { tableRows: [{ tableCells: [{ content: [para(8, 'x\n')] }] }] } },
+        para(14, '\n'),
+      ],
+    },
+  } as never);
+  assert.equal(paragraphDeleteRanges([beforeTable[0]!], beforeTable)[0]!.leavesEmptyParagraph, true);
+});
+
+test('deletions are merged and applied last-first so indices stay valid', async () => {
+  const { normalizeDeletes } = await import('./google/docsModel.js');
+  assert.deepEqual(
+    normalizeDeletes([
+      { startIndex: 1, endIndex: 5 },
+      { startIndex: 20, endIndex: 25 },
+      { startIndex: 4, endIndex: 9 },
+      { startIndex: 30, endIndex: 30 },
+    ]),
+    [
+      { startIndex: 20, endIndex: 25 },
+      { startIndex: 1, endIndex: 9 },
+    ],
+  );
+});
+
+test('inline markdown becomes text plus style spans', async () => {
+  const { parseInline } = await import('./google/docsModel.js');
+  const r = parseInline('Ett **fett** och *kursivt*, ~~struket~~ och [länk](https://x.se)');
+  assert.equal(r.text, 'Ett fett och kursivt, struket och länk');
+  const at = (s: { start: number; end: number }) => r.text.slice(s.start, s.end);
+  assert.deepEqual(
+    r.spans.map((s) => [at(s), Object.keys(s).filter((k) => k !== 'start' && k !== 'end')[0]]),
+    [
+      ['fett', 'bold'],
+      ['kursivt', 'italic'],
+      ['struket', 'strikethrough'],
+      ['länk', 'link'],
+    ],
+  );
+});
+
+test('stray markers stay literal', async () => {
+  const { parseInline } = await import('./google/docsModel.js');
+  for (const s of ['5 * 3 = 15', 'snake_case_name', 'a ** b', 'pris: 10*']) {
+    const r = parseInline(s);
+    assert.equal(r.text, s);
+    assert.deepEqual(r.spans, []);
+  }
+  assert.equal(parseInline('\\*inte kursiv\\*').text, '*inte kursiv*');
+  const nested = parseInline('**fet *och kursiv***');
+  assert.equal(nested.text, 'fet och kursiv');
+  assert.equal(nested.spans.length, 2);
+});
+
+test('markdown-lite: one line per paragraph, blank lines only separate', async () => {
+  const { parseMarkdownLite } = await import('./google/docsModel.js');
+  const blocks = parseMarkdownLite('# Rubrik\n\nText\n- a\n  - b\n1. ett\n2) två\n\n\nSlut');
+  assert.deepEqual(
+    blocks.map((b) => [b.kind, b.level ?? b.nesting ?? null, b.text]),
+    [
+      ['heading', 1, 'Rubrik'],
+      ['normal', null, 'Text'],
+      ['bullet', 0, 'a'],
+      ['bullet', 1, 'b'],
+      ['numbered', 0, 'ett'],
+      ['numbered', 0, 'två'],
+      ['normal', null, 'Slut'],
+    ],
+  );
+});
+
+test('a trailing backslash or \\v gives a soft line break inside the paragraph', async () => {
+  const { parseMarkdownLite, parsePlain } = await import('./google/docsModel.js');
+  const [b] = parseMarkdownLite('rad ett\\\nrad två');
+  assert.equal(b!.text, 'rad ett\vrad två');
+  assert.equal(parseMarkdownLite('a\vb')[0]!.text, 'a\vb');
+  assert.deepEqual(
+    parsePlain('a\n\nb').map((p) => p.text),
+    ['a', '', 'b'],
+    'plain keeps blank lines',
+  );
+});
+
+test('inserted paragraphs are reset to plain text before their own formatting', async () => {
+  // The bug this prevents: inserting after a numbered-list item made every new
+  // line a list item and renumbered the rest of the list.
+  const { buildInsertRequests, parseMarkdownLite } = await import('./google/docsModel.js');
+  const blocks = parseMarkdownLite('Vanlig **fet**\n## Rubrik');
+  const { requests } = buildInsertRequests(blocks, {
+    index: 10,
+    prefix: '\n',
+    suffix: '',
+    tabId: 't.2',
+  });
+  const kinds = requests.map((r) => Object.keys(r)[0]);
+  assert.deepEqual(kinds.slice(0, 4), [
+    'insertText',
+    'updateTextStyle',
+    'deleteParagraphBullets',
+    'updateParagraphStyle',
+  ]);
+  assert.equal(requests[0]!.insertText!.text, '\nVanlig fet\nRubrik');
+  assert.equal(requests[0]!.insertText!.location!.tabId, 't.2');
+  // New paragraphs start after the split-off newline at 10, and the range runs
+  // through the newline that ends the last of them.
+  assert.deepEqual(requests[2]!.deleteParagraphBullets!.range, { startIndex: 11, endIndex: 29, tabId: 't.2' });
+  assert.equal(requests[3]!.updateParagraphStyle!.paragraphStyle!.namedStyleType, 'NORMAL_TEXT');
+  assert.match(requests[3]!.updateParagraphStyle!.fields!, /indentStart/);
+  const heading = requests.find((r) => r.updateParagraphStyle?.paragraphStyle?.namedStyleType === 'HEADING_2');
+  assert.deepEqual(heading!.updateParagraphStyle!.range, { startIndex: 22, endIndex: 29, tabId: 't.2' });
+  const bold = requests.find((r) => r.updateTextStyle?.textStyle?.bold);
+  assert.deepEqual(bold!.updateTextStyle!.range, { startIndex: 18, endIndex: 21, tabId: 't.2' });
+});
+
+test('lists are created last, last-first, with nesting as leading tabs', async () => {
+  const { buildInsertRequests, parseMarkdownLite } = await import('./google/docsModel.js');
+  const blocks = parseMarkdownLite('- a\n  - b\nmitt\n1. x');
+  const { requests } = buildInsertRequests(blocks, { index: 1, prefix: '', suffix: '' });
+  assert.equal(requests[0]!.insertText!.text, 'a\n\tb\nmitt\nx');
+  const bullets = requests.filter((r) => r.createParagraphBullets);
+  assert.deepEqual(
+    bullets.map((r) => [r.createParagraphBullets!.bulletPreset, r.createParagraphBullets!.range]),
+    [
+      ['NUMBERED_DECIMAL_ALPHA_ROMAN', { startIndex: 11, endIndex: 13 }],
+      ['BULLET_DISC_CIRCLE_SQUARE', { startIndex: 1, endIndex: 6 }],
+    ],
+  );
+  assert.equal(Object.keys(requests[requests.length - 1]!)[0], 'createParagraphBullets');
+});
+
+test('inheritStyle keeps the anchor paragraph\'s list membership', async () => {
+  const { buildInsertRequests, parsePlain } = await import('./google/docsModel.js');
+  const { requests } = buildInsertRequests(parsePlain('nytt listobjekt'), {
+    index: 20,
+    prefix: '\n',
+    suffix: '',
+    inheritStyle: true,
+  });
+  assert.deepEqual(requests.map((r) => Object.keys(r)[0]), ['insertText']);
+});
+
+test('append starts a new paragraph unless the last one is empty', async () => {
+  // Inserting before the final newline of a non-empty paragraph glued the text
+  // onto it — an appended heading restyled the document's last paragraph.
+  const { appendPlan, listParagraphs } = await import('./google/docsModel.js');
+  const full = listParagraphs({ body: bodyOf('ett\n', 'Sista\n') } as never);
+  assert.deepEqual(appendPlan(full, 't.0'), { index: 10, prefix: '\n', suffix: '', tabId: 't.0' });
+  const trailingBlank = listParagraphs({ body: bodyOf('ett\n', '\n') } as never);
+  assert.deepEqual(appendPlan(trailingBlank), { index: 5, prefix: '', suffix: '' });
+});
+
+test('text formatting sends only the properties given, and "" clears a colour', async () => {
+  const { textStyleFor } = await import('./google/docs.js');
+  const a = textStyleFor({ strikethrough: true, color: '#ff0000' });
+  assert.equal(a.fields, 'strikethrough,foregroundColor');
+  assert.deepEqual(a.textStyle.foregroundColor, { color: { rgbColor: { red: 1, green: 0, blue: 0 } } });
+  const b = textStyleFor({ highlight: '' });
+  assert.equal(b.fields, 'backgroundColor');
+  assert.equal(b.textStyle.backgroundColor, undefined);
+});
+
+test('base64 images in exports become a short placeholder', async () => {
+  const { stripDataUris } = await import('./google/docsModel.js');
+  const img = `data:image/png;base64,${'A'.repeat(4000)}==`;
+  const md = `Text\n![][image1]\n\n[image1]: <${img}>\n<img src="${img}">`;
+  const r = stripDataUris(md);
+  assert.equal(r.removed, 2);
+  assert.ok(r.text.length < 200);
+  assert.match(r.text, /\[image1\]: <\[image removed: image\/png, ~3 kB\]>/);
+  assert.equal(stripDataUris('no images').removed, 0);
+});
+
+test('a document write can be pinned to a revision', async () => {
+  const source = await readFile(new URL('./google/docs.ts', import.meta.url), 'utf8');
+  assert.match(source, /writeControl: \{ requiredRevisionId \}/);
+  assert.match(source, /REVISION MISMATCH/);
 });
 
 /* ------------------------------------------------------------------ *
@@ -981,7 +1329,13 @@ test('no field mask mixes dot notation with sub-selection parentheses', async ()
   // argument — sub-selection must nest, as "sheets(properties(sheetId,title))".
   // The request fails wholesale, so one bad mask takes out an entire tool while
   // its neighbours keep working, which makes it look like a permissions problem.
-  const files = ['./google/sheets.ts', './google/drive.ts', './google/docs.ts', './google/calendar.ts'];
+  const files = [
+    './google/sheets.ts',
+    './google/drive.ts',
+    './google/docs.ts',
+    './google/comments.ts',
+    './google/calendar.ts',
+  ];
   const offenders: string[] = [];
 
   for (const file of files) {
