@@ -21,6 +21,7 @@ import {
   updateFile,
   uploadFile,
 } from '../../google/drive.js';
+import { stripDataUris } from '../../google/docsModel.js';
 import { ReauthRequiredError, ScopeMissingError } from '../../google/oauth.js';
 import {
   buildDriveDownloadUrl,
@@ -156,7 +157,8 @@ export function registerDriveTools(server: McpServer, user: User): void {
       title: 'Read a Drive file as text',
       description:
         'Returns the text content of a Drive file. Google Docs, Sheets and Slides are ' +
-        'exported automatically (Docs to Markdown, Sheets to CSV, Slides to plain text). ' +
+        'exported automatically (Docs to Markdown, all tabs, embedded images replaced by a ' +
+        'placeholder; Sheets to CSV; Slides to plain text). ' +
         'Binary formats such as PDF or images cannot be read as text — use ' +
         'get_drive_download_url for those and hand the URL to the user.',
       inputSchema: {
@@ -216,12 +218,24 @@ export function registerDriveTools(server: McpServer, user: User): void {
           );
         }
 
-        const { text, truncated } = clamp(data.toString('utf8'), maxChars);
+        // Docs exported to Markdown or HTML inline every image as base64; one
+        // screenshot was 62k characters and pushed the text past maxChars.
+        const stripped = stripDataUris(data.toString('utf8'));
+        const { text, truncated } = clamp(stripped.text, maxChars);
         return ok({
           account: acc.email,
           file: meta,
           contentType,
           exported: meta.needsExport,
+          ...(stripped.removed
+            ? {
+                imagesRemoved: stripped.removed,
+                imageCharactersRemoved: stripped.removedChars,
+              }
+            : {}),
+          ...(meta.mimeType === 'application/vnd.google-apps.document'
+            ? { note: 'For a Google Doc, read_doc gives the exact text per tab plus a revisionId for edits.' }
+            : {}),
           contentTruncated: truncated,
           content: text,
         });
