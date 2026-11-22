@@ -382,8 +382,12 @@ before newly connected mailboxes bring their tools into view.
 `format_sheet_range`, `auto_resize_sheet_columns`, `set_sheet_layout`,
 `create_spreadsheet`
 
-**Docs** — `read_doc`, `append_to_doc`, `append_doc_heading`, `replace_doc_text`,
-`create_doc`
+**Docs** — `read_doc`, `list_doc_tabs`, `create_doc`, `create_doc_tab`,
+`append_to_doc`, `append_doc_heading`, `insert_doc_text`, `delete_doc_text`,
+`replace_doc_text`, `format_doc_text`
+
+**Doc comments** — `list_doc_comments`, `add_doc_comment`,
+`reply_to_doc_comment`, `resolve_doc_comment`
 
 **Attachments** — `create_upload_url`, `list_uploads`
 
@@ -417,7 +421,8 @@ Three behaviours worth knowing:
 - **Google Docs, Sheets and Slides hold no bytes.** They are exported on the
   way out — to Markdown, CSV and plain text when read as text, and to .docx,
   .xlsx and .pptx when downloaded. Asking for the "raw" content of a Doc is not
-  a thing that exists.
+  a thing that exists. The Markdown export covers every tab but does not
+  separate them; `read_doc` does.
 - **Shared drives are included.** Every call opts in explicitly; without that
   the API quietly pretends team-drive content does not exist and a search
   returns a confident, wrong "no results".
@@ -471,7 +476,7 @@ and Docs APIs instead:
   formatting, column widths and frozen rows intact — the right way to start a
   new month from the last one. Clear the carried-over values with
   `clear_sheet_range`, which keeps the formatting.
-- `append_to_doc` and `replace_doc_text` edit a document in place.
+- The Docs tools edit a document in place — see [Google Docs](#google-docs).
 
 Both APIs are authorised by the **same Drive scope**, so enabling them needs no
 new consent. They do need switching on once in the Cloud project:
@@ -482,6 +487,103 @@ through a pointless re-authentication.
 
 Ranges use A1 notation (`'Jul 2026'!B2:F40`). A bare name such as `Jun 2026` or
 `Sheet1` means the whole tab; `A1` means that cell.
+
+### Google Docs
+
+**Tabs.** A Doc can have several tabs, nested. The API returns only the first
+one unless asked (`includeTabsContent`), so every read here asks: `read_doc`
+returns all tabs, each under a `=== Tab: … (tabId …) ===` header, and
+`list_doc_tabs` lists them. Every write takes an optional `tabId`; without one,
+appends go to the first tab and searches (`insert_doc_text`, `delete_doc_text`,
+`format_doc_text`, `replace_doc_text`) cover every tab. `create_doc_tab` adds a
+tab, optionally nested under another and with initial content.
+
+**Editing model.** Text is located, never addressed by index:
+
+- `insert_doc_text` puts new paragraphs directly after (or before) the
+  paragraph containing an `anchor`. New paragraphs are reset to plain
+  `NORMAL_TEXT` — bullets removed, the indent that removing a bullet leaves
+  behind cleared, character formatting cleared — because inserted text
+  otherwise inherits its surroundings: split off the end of a numbered-list item
+  and every new line becomes a list item, renumbering the rest of the list.
+  `inheritStyle: true` is the opt-in for exactly that, e.g. adding an item to the
+  same list.
+- `delete_doc_text` removes whole paragraphs (default) or just the matched
+  characters. A paragraph goes with its newline, so nothing is left as an empty
+  line or empty list item. The last paragraph of the body or a table cell owns a
+  newline the API will not delete; that paragraph is joined onto the previous
+  one instead. The only paragraph of a cell, or the line right before a table,
+  can only be emptied, and the response says so.
+- `append_to_doc` / `append_doc_heading` always start a new paragraph. (They
+  used to insert before the document's final newline, so text was glued onto a
+  non-empty last paragraph — and an appended heading restyled it.)
+- `format_doc_text` sets bold, italic, underline, strikethrough, text colour or
+  highlight on existing text. Strikethrough plus a colour shows a correction.
+- `replace_doc_text` is Google's own `replaceAllText`, for in-paragraph edits and
+  template placeholders.
+
+Searches refuse to guess: text that occurs more than once is an `AMBIGUOUS`
+error listing the occurrences, until the caller passes `occurrence` (1-based),
+`all: true`, a `tabId` or a longer string. A missing anchor changes nothing.
+
+**Markdown-lite.** Text given to `append_to_doc`, `insert_doc_text`,
+`create_doc` and `create_doc_tab` is parsed unless `format: "plain"`: one line =
+one paragraph, `#`–`######` headings, `-`/`*` bullets and `1.` numbered lists
+(two spaces of indentation per nesting level), `**bold**`, `*italic*`,
+`~~strike~~`, `[text](url)`, `\` to escape a marker. Blank lines only separate.
+**Soft line breaks** (a new line inside the same paragraph or list item, Shift+Enter
+in the editor) are a `\v` character in Docs; write a line ending in `\`, or a
+literal `\v` (`\u000b` in JSON). `format: "plain"` inserts every line literally,
+blank ones included.
+
+**Why a search could find nothing for visible text.** Investigated against a
+live document (Nov 2026):
+
+- **List numbers and bullets are not text.** `"1. Första punkt"` never matches;
+  `"Första punkt"` does.
+- **Markdown exports are not the document.** `read_drive_file` exports Docs to
+  Markdown, which adds list numbers, `\` escapes and trailing double spaces.
+  Text copied from there and searched for fails. `read_doc` returns the real text.
+- **Look-alike characters.** Docs autocorrects `'` to `’`, `"` to `“”`, `-` to
+  `–` and `...` to `…`. Google's `replaceAllText` is inconsistent about these: a
+  straight-quote search matches curly quotes but not the reverse, `...` and `…`
+  match each other, a non-breaking space does not match a space. The
+  anchor-based tools search exactly first and then, only if that finds nothing,
+  treat these variants (and `\n` vs `\v`) as equal, flagging the result
+  `matchedLoosely`.
+- **Newlines.** `replaceAllText` *does* match across paragraph breaks — but the
+  paragraphs a replacement creates inherit the style of the one they start in,
+  which is how a multi-line replacement inside a numbered list became new list
+  items. `replace_doc_text` now adds a note whenever the search or replacement
+  contains a newline, and another when replacing with `""` (which empties a
+  paragraph rather than removing it).
+
+**Revision guard.** `read_doc` and `list_doc_tabs` return `revisionId`; every
+write accepts `requiredRevisionId` and returns the new one. If the document has
+changed since that revision — someone else editing at the same time — nothing is
+written and the tool answers `REVISION MISMATCH` with what to do. Writes that
+compute positions (insert, delete, format, append) always pin themselves to the
+revision they just read, so their indices can never land in text that moved; a
+race lost without a caller-supplied revision is retried once on a fresh read.
+
+**Comments** go through the Drive API (`comments` / `replies`), under the Drive
+scope every Google account already grants — no re-consent. Listing, replying,
+resolving and reopening work fully. **Adding a comment cannot anchor it to a
+text range**: the Docs anchor format is internal to the editor and the API does
+not accept one. A comment created here is a document-level comment; its
+`quotedText` is stored and shown as a quote, but nothing in the text is
+highlighted. Verified live: the created comment comes back with
+`quotedFileContent` set and no `anchor`. To point at a passage visibly, combine
+it with `format_doc_text` (highlight). Comments made in the editor show up in
+`list_doc_comments` with `anchored: true`.
+
+**Images in exports.** Google's Markdown and HTML exports inline every image as
+base64 — one screenshot was 62k characters, enough to push the document's text
+past `maxChars`. `read_drive_file` replaces each with
+`[image removed: image/png, ~45 kB]` and reports `imagesRemoved`.
+
+The `addDocumentTab` request is newer than the pinned `googleapis` typings, so
+it is sent through a cast; the API itself accepts it.
 
 ### Attachments
 

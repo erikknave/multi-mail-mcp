@@ -83,7 +83,7 @@ scope, and prefer an existing one that already covers the call.
 ## Tool descriptions are the interface
 
 They are what the model reads at the moment it decides. They are also the whole
-context cost — measured at ~17k tokens for the full 60-tool surface, so a
+context cost — measured at ~17k tokens for the 60-tool surface before the Docs expansion (now 69 tools), so a
 paragraph is roughly 60 tokens charged on every request.
 
 - Only tools a user's mailboxes can use are registered (`mcp/server.ts`). A tool
@@ -91,6 +91,28 @@ paragraph is roughly 60 tokens charged on every request.
 - Say the load-bearing thing, once. Repeating a caveat in four sibling tools was
   a real mistake made and then undone here.
 - Never register a stub or planned tool.
+
+## Google Docs
+
+The Docs layer is split so the hard part is testable: `google/docsModel.ts` is
+pure (tabs, paragraphs, search, delete ranges, Markdown-lite → requests) and
+fully unit-tested; `google/docs.ts` does read → plan → write; `google/comments.ts`
+is the Drive comments API. Things that cost time to learn:
+
+- **Always `includeTabsContent: true`.** Without it the API returns only the
+  first tab, silently. `flattenTabs` walks `childTabs` recursively.
+- **Indices are UTF-16 code units** — the same as JS string offsets, so
+  `indexedText()` builds a string where position *i* is document index *i* and a
+  regex match is a document range directly.
+- **Inserted text inherits its surroundings** (list membership, heading, bold).
+  `buildInsertRequests` resets new paragraphs explicitly, then applies the
+  requested formatting, and creates bullets last and last-first because
+  `createParagraphBullets` consumes the leading tabs that encode nesting.
+- **Index-based writes are pinned to the revision just read**
+  (`readModifyWrite`). Never compute indices from one read and write them
+  without `writeControl`.
+- **Test on a throwaway document you created**, never a real one: create it
+  with `create_doc`, exercise the tools, then `trash_drive_file` it.
 
 ## Conventions
 
