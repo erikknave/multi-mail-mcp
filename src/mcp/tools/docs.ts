@@ -22,7 +22,8 @@ import {
   tabText,
   type Block,
 } from '../../google/docsModel.js';
-import { docsClient, resolveAccount, ServiceError } from '../../service.js';
+import { addComment, listComments, replyToComment } from '../../google/comments.js';
+import { docsClient, driveClient, resolveAccount, ServiceError } from '../../service.js';
 import { guard, ok } from '../reply.js';
 
 const accountArg = z
@@ -555,6 +556,127 @@ export function registerDocsTools(server: McpServer, user: User): void {
           title: doc.title,
           revisionId: doc.revisionId,
           url: docUrl(doc.documentId),
+        });
+      }),
+  );
+
+  /* ---------------------------------------------------------------- *
+   * Comments
+   * ---------------------------------------------------------------- */
+
+  server.registerTool(
+    'list_doc_comments',
+    {
+      title: 'List comments on a Google Doc',
+      description:
+        'Lists comments with their replies, author, quoted text and resolved state. Works ' +
+        'for any Drive file that supports comments.',
+      inputSchema: {
+        documentId: docArg,
+        includeResolved: z.boolean().default(false).describe('Include resolved comments.'),
+        limit: z.number().int().min(1).max(500).default(100),
+        account: accountArg,
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ documentId, includeResolved, limit, account }) =>
+      guard(async () => {
+        const acc = resolveAccount(user, account);
+        const drive = await driveClient(acc);
+        const { comments, more } = await listComments(drive, documentId, includeResolved, limit);
+        return ok({
+          account: acc.email,
+          documentId,
+          count: comments.length,
+          ...(more ? { moreAvailable: true } : {}),
+          comments,
+        });
+      }),
+  );
+
+  server.registerTool(
+    'add_doc_comment',
+    {
+      title: 'Comment on a Google Doc',
+      description:
+        "Adds a comment. Google's API cannot attach it to a text range: it appears as a " +
+        'document-level comment and nothing in the text is highlighted. quotedText is shown ' +
+        'with the comment as a quote, so name the passage there. To mark text visibly, ' +
+        'combine with format_doc_text (e.g. highlight).',
+      inputSchema: {
+        documentId: docArg,
+        content: z.string().describe('Comment text.'),
+        quotedText: z.string().optional().describe('The passage the comment is about.'),
+        account: accountArg,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ documentId, content, quotedText, account }) =>
+      guard(async () => {
+        if (content.trim() === '') throw new ServiceError('The comment cannot be empty.');
+        const acc = resolveAccount(user, account);
+        const drive = await driveClient(acc);
+        const comment = await addComment(drive, documentId, content, quotedText);
+        return ok({ created: true, account: acc.email, documentId, comment });
+      }),
+  );
+
+  server.registerTool(
+    'reply_to_doc_comment',
+    {
+      title: 'Reply to a comment on a Google Doc',
+      description: 'Replies to a comment thread, optionally resolving it in the same step.',
+      inputSchema: {
+        documentId: docArg,
+        commentId: z.string().describe('From list_doc_comments.'),
+        content: z.string().describe('Reply text.'),
+        resolve: z.boolean().default(false).describe('Also mark the thread resolved.'),
+        account: accountArg,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ documentId, commentId, content, resolve, account }) =>
+      guard(async () => {
+        if (content.trim() === '') throw new ServiceError('The reply cannot be empty.');
+        const acc = resolveAccount(user, account);
+        const drive = await driveClient(acc);
+        const reply = await replyToComment(
+          drive,
+          documentId,
+          commentId,
+          content,
+          resolve ? 'resolve' : undefined,
+        );
+        return ok({ replied: true, account: acc.email, documentId, commentId, ...reply });
+      }),
+  );
+
+  server.registerTool(
+    'resolve_doc_comment',
+    {
+      title: 'Resolve or reopen a comment on a Google Doc',
+      description: 'Marks a comment thread resolved (or reopens it), with an optional closing note.',
+      inputSchema: {
+        documentId: docArg,
+        commentId: z.string().describe('From list_doc_comments.'),
+        note: z.string().optional().describe('Optional reply posted with the change.'),
+        reopen: z.boolean().default(false).describe('Reopen a resolved thread instead.'),
+        account: accountArg,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ documentId, commentId, note, reopen, account }) =>
+      guard(async () => {
+        const acc = resolveAccount(user, account);
+        const drive = await driveClient(acc);
+        const action = reopen ? 'reopen' : 'resolve';
+        const reply = await replyToComment(drive, documentId, commentId, note ?? '', action);
+        return ok({
+          [reopen ? 'reopened' : 'resolved']: true,
+          account: acc.email,
+          documentId,
+          commentId,
+          ...reply,
         });
       }),
   );
