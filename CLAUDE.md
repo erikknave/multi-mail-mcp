@@ -83,7 +83,8 @@ scope, and prefer an existing one that already covers the call.
 ## Tool descriptions are the interface
 
 They are what the model reads at the moment it decides. They are also the whole
-context cost — measured at ~17k tokens for the 60-tool surface before the Docs expansion (now 69 tools), so a
+context cost — measured at ~17k tokens for 60 tools, and ~22k for 69 after the Docs expansion
+(Nov 2026, tools/list JSON at ~3.6 chars/token), so a
 paragraph is roughly 60 tokens charged on every request.
 
 - Only tools a user's mailboxes can use are registered (`mcp/server.ts`). A tool

@@ -351,7 +351,7 @@ costs to describe, and a shorter list is one a model chooses from more
 accurately. So the Drive, Sheets and Docs tools appear once a Google mailbox is
 connected, the chat tools once a Microsoft or Slack one is, and a user with
 nothing connected sees only the three account tools — which is what tells them
-to connect an account. In tokens, the full surface is around 17k; a
+to connect an account. In tokens, the full surface is around 22k (69 tools); a
 Microsoft-only user sees about 8.7k, and a user with no mailboxes about 0.8k.
 
 The endpoint is stateless, so the list is recomputed on every request and needs
