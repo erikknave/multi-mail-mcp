@@ -7,6 +7,7 @@ import {
   createDoc,
   deleteText,
   describeTabs,
+  fetchDocImage,
   fillNewTab,
   formatText,
   getDocument,
@@ -15,15 +16,24 @@ import {
   replaceText,
 } from '../../google/docs.js';
 import {
+  describeObject,
   flattenTabs,
   listParagraphs,
   parseMarkdownLite,
   parsePlain,
+  tabDisplayText,
+  tabObjects,
   tabText,
   type Block,
 } from '../../google/docsModel.js';
 import { addComment, listComments, replyToComment } from '../../google/comments.js';
-import { docsClient, driveClient, resolveAccount, ServiceError } from '../../service.js';
+import {
+  docsClient,
+  docsClientWithAuth,
+  driveClient,
+  resolveAccount,
+  ServiceError,
+} from '../../service.js';
 import { guard, ok } from '../reply.js';
 
 const accountArg = z
@@ -108,15 +118,22 @@ export function registerDocsTools(server: McpServer, user: User): void {
       description:
         'Returns the plain text of a Google Doc — every tab, each under a "=== Tab: … ===" ' +
         'header, tables included — plus the tab list and revisionId. List numbers and ' +
-        'bullets are not part of the text. structure: true returns paragraphs with style, ' +
-        'list membership and index range instead.',
+        'bullets are not part of the text. Images and other non-text elements appear as ' +
+        'placeholders, e.g. [image: kix.…, "alt", 15.9×8.6 cm], and images floated on the ' +
+        'page as a [positioned image: …] line after the paragraph they are anchored to; ' +
+        'view one with get_doc_image. Placeholders are not document text — never use them ' +
+        'as search or anchor text. structure: true returns paragraphs with style, list ' +
+        'membership, index range and objects instead.',
       inputSchema: {
         documentId: docArg,
         tabId: z.string().optional().describe('Read only this tab. Omit for all tabs.'),
         structure: z
           .boolean()
           .default(false)
-          .describe('Return paragraphs (text, style, list, startIndex/endIndex) instead of one text.'),
+          .describe(
+            'Return paragraphs (text, style, list, startIndex/endIndex, objects) and each ' +
+              "tab's images and drawings instead of one text.",
+          ),
         maxChars: z
           .number()
           .int()
@@ -161,24 +178,54 @@ export function registerDocsTools(server: McpServer, user: User): void {
                 ...(p.list ? { list: p.list } : {}),
                 ...(p.container !== 'body' ? { inTable: true } : {}),
                 text: p.text.replace(/\n$/, ''),
+                ...(p.objects ? { objects: p.objects.map((o) => describeObject(t, o)) } : {}),
               });
             }
-            return { tabId: t.tabId, title: t.title, paragraphs };
+            const objects = tabObjects(t);
+            return {
+              tabId: t.tabId,
+              title: t.title,
+              ...(objects.length ? { objects } : {}),
+              paragraphs,
+            };
           });
-          return ok({ ...base, contentTruncated: truncated, content: out });
+          return ok({
+            ...base,
+            contentTruncated: truncated,
+            ...(out.some((t) => t.objects)
+              ? {
+                  note:
+                    'Inline objects occupy one character (U+FFFC) of paragraph text at their ' +
+                    'index; positioned ones occupy none and float near the paragraph they are ' +
+                    'anchored to. View an image with get_doc_image.',
+                }
+              : {}),
+            content: out,
+          });
         }
 
         const text =
           tabs.length === 1
-            ? tabText(selected[0]!)
+            ? tabDisplayText(selected[0]!)
             : selected
-                .map((t) => `=== Tab: ${t.title} (tabId ${t.tabId}) ===\n${tabText(t)}`)
+                .map((t) => `=== Tab: ${t.title} (tabId ${t.tabId}) ===\n${tabDisplayText(t)}`)
                 .join('\n');
         const truncated = text.length > maxChars;
+        // Anything shown differently from the searchable text is a placeholder.
+        const hasPlaceholders = selected.some((t) => tabDisplayText(t) !== tabText(t));
         return ok({
           ...base,
           characterCount: text.length,
           contentTruncated: truncated,
+          ...(hasPlaceholders
+            ? {
+                note:
+                  'Bracketed placeholders ([image: …], [positioned image: …], [footnote …], ' +
+                  '[page break] …) stand for non-text elements and are not in the document ' +
+                  'text: search and anchor on the words around them. View an image with ' +
+                  'get_doc_image(objectId).',
+              }
+            : {}),
           content: truncated
             ? `${text.slice(0, maxChars)}\n\n[...truncated, ${text.length - maxChars} more characters]`
             : text,
@@ -206,6 +253,51 @@ export function registerDocsTools(server: McpServer, user: User): void {
           revisionId: doc.revisionId ?? null,
           tabs: describeTabs(flattenTabs(doc)),
         });
+      }),
+  );
+
+  server.registerTool(
+    'get_doc_image',
+    {
+      title: 'View an image in a Google Doc',
+      description:
+        'Returns an image from a Google Doc so you can see it — inline or positioned, by ' +
+        'the objectId shown in read_doc placeholders. Drawings cannot be fetched (the API ' +
+        'does not expose them); export the document as PDF instead.',
+      inputSchema: {
+        documentId: docArg,
+        objectId: z.string().describe('Object id from read_doc, e.g. "kix.7kvq0v9kbmuy".'),
+        tabId: z.string().optional().describe('Tab to look in. Omit to look in every tab.'),
+        account: accountArg,
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ documentId, objectId, tabId, account }) =>
+      guard(async () => {
+        const acc = resolveAccount(user, account);
+        const { docs, auth } = await docsClientWithAuth(acc);
+        const img = await fetchDocImage(docs, auth, documentId, objectId, tabId);
+        const meta = {
+          account: acc.email,
+          documentId,
+          tabId: img.tabId,
+          tabTitle: img.tabTitle,
+          ...img.object,
+          mimeType: img.mimeType,
+          bytes: img.bytes,
+          ...(img.crop
+            ? {
+                crop: img.crop,
+                cropNote: 'The document shows this image cropped by these fractions of each side.',
+              }
+            : {}),
+        };
+        return {
+          content: [
+            { type: 'text' as const, text: JSON.stringify(meta, null, 2) },
+            { type: 'image' as const, data: img.data.toString('base64'), mimeType: img.mimeType },
+          ],
+        };
       }),
   );
 

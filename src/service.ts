@@ -283,6 +283,13 @@ export async function docsClient(account: Account): Promise<docs_v1.Docs> {
   return docsFor(await getAuthorizedClient(account));
 }
 
+/** The Docs client plus its credentials, for fetching an image's contentUri as the account. */
+export async function docsClientWithAuth(account: Account) {
+  requireCapability(account, 'drive');
+  const auth = await getAuthorizedClient(account);
+  return { docs: docsFor(auth), auth };
+}
+
 /**
  * Google answers a call to an API that is switched off in the Cloud project
  * with a 403 whose text buries the fix in a wall of prose. Recognise it and

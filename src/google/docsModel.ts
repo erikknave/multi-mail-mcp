@@ -22,6 +22,15 @@ export interface TabInfo {
   parentTabId: string | null;
   body: docs_v1.Schema$Body | undefined;
   lists: Record<string, docs_v1.Schema$List> | undefined;
+  /**
+   * Images and drawings live outside the body: the body holds only a
+   * reference (an inline element, or an id on the paragraph a positioned
+   * object is anchored to). Without these maps a reader cannot tell an image
+   * from any other non-text element — or, for positioned ones, that it exists.
+   */
+  inlineObjects?: Record<string, docs_v1.Schema$InlineObject>;
+  positionedObjects?: Record<string, docs_v1.Schema$PositionedObject>;
+  footnotes?: Record<string, docs_v1.Schema$Footnote>;
 }
 
 /**
@@ -44,6 +53,9 @@ export function flattenTabs(doc: docs_v1.Schema$Document): TabInfo[] {
         parentTabId: p.parentTabId ?? parent,
         body: tab.documentTab?.body,
         lists: tab.documentTab?.lists ?? undefined,
+        inlineObjects: tab.documentTab?.inlineObjects ?? undefined,
+        positionedObjects: tab.documentTab?.positionedObjects ?? undefined,
+        footnotes: tab.documentTab?.footnotes ?? undefined,
       });
       walk(tab.childTabs, depth + 1, tabId);
     }
@@ -59,6 +71,9 @@ export function flattenTabs(doc: docs_v1.Schema$Document): TabInfo[] {
       parentTabId: null,
       body: doc.body,
       lists: doc.lists ?? undefined,
+      inlineObjects: doc.inlineObjects ?? undefined,
+      positionedObjects: doc.positionedObjects ?? undefined,
+      footnotes: doc.footnotes ?? undefined,
     });
   }
   return out;
@@ -83,6 +98,18 @@ export interface ParagraphInfo {
   container: string;
   /** What comes directly after this paragraph in its container, if anything. */
   next: 'paragraph' | 'table' | 'other' | null;
+  /**
+   * Images and drawings in or anchored to this paragraph. An inline one sits
+   * at `index` (one U+FFFC in `text`); a positioned one floats on the page,
+   * occupies no index at all, and `index` is the start of this paragraph.
+   */
+  objects?: ObjectRef[];
+}
+
+export interface ObjectRef {
+  type: 'inline' | 'positioned';
+  objectId: string;
+  index: number;
 }
 
 /** Stands in for anything that occupies an index but is not text: images, chips, breaks. */
@@ -122,6 +149,7 @@ export function listParagraphs(tab: Pick<TabInfo, 'body' | 'lists'>): ParagraphI
         const after = elements[i + 1];
         const bullet = el.paragraph.bullet;
         const level = bullet?.nestingLevel ?? 0;
+        const objects = paragraphObjects(el.paragraph, el.startIndex ?? 0);
         out.push({
           startIndex: el.startIndex ?? 0,
           endIndex: el.endIndex ?? 0,
@@ -138,6 +166,7 @@ export function listParagraphs(tab: Pick<TabInfo, 'body' | 'lists'>): ParagraphI
             : {}),
           container,
           next: !after ? null : after.paragraph ? 'paragraph' : after.table ? 'table' : 'other',
+          ...(objects.length ? { objects } : {}),
         });
       }
       for (const row of el.table?.tableRows ?? []) {
@@ -156,6 +185,237 @@ export function tabText(tab: Pick<TabInfo, 'body' | 'lists'>): string {
   return listParagraphs(tab)
     .map((p) => p.text)
     .join('');
+}
+
+/* ------------------------------------------------------------------ *
+ * Images, drawings and other non-text elements
+ *
+ * The text the write tools search stays exactly as the document indexes it —
+ * one U+FFFC per inline object — so an anchor next to an image still matches.
+ * What a *reader* is shown is different: each non-text element becomes a
+ * bracketed placeholder saying what it is. A speech-bubble picture floated
+ * next to a dialogue used to be invisible to every agent: positioned objects
+ * occupy no index, so they left no trace in the text at all.
+ * ------------------------------------------------------------------ */
+
+function paragraphObjects(p: docs_v1.Schema$Paragraph, paragraphStart: number): ObjectRef[] {
+  const out: ObjectRef[] = [];
+  for (const el of p.elements ?? []) {
+    const id = el.inlineObjectElement?.inlineObjectId;
+    if (id) out.push({ type: 'inline', objectId: id, index: el.startIndex ?? paragraphStart });
+  }
+  for (const id of p.positionedObjectIds ?? []) {
+    out.push({ type: 'positioned', objectId: id, index: paragraphStart });
+  }
+  return out;
+}
+
+export interface EmbeddedObjectInfo {
+  type: 'inline' | 'positioned';
+  objectId: string;
+  /** Inline: the object's own index. Positioned: the start of its anchor paragraph. Null if unanchored in the body (header, footer, footnote). */
+  index: number | null;
+  kind: 'image' | 'drawing' | 'other';
+  title?: string;
+  /** Alt text. */
+  description?: string;
+  widthPt?: number;
+  heightPt?: number;
+  /** Positioned only: WRAP_TEXT, BREAK_LEFT, IN_FRONT_OF_TEXT, BEHIND_TEXT … */
+  layout?: string;
+}
+
+type ObjectMaps = Pick<TabInfo, 'inlineObjects' | 'positionedObjects'>;
+
+export function embeddedObject(
+  tab: ObjectMaps,
+  type: 'inline' | 'positioned',
+  objectId: string,
+): docs_v1.Schema$EmbeddedObject | undefined {
+  return type === 'inline'
+    ? tab.inlineObjects?.[objectId]?.inlineObjectProperties?.embeddedObject ?? undefined
+    : tab.positionedObjects?.[objectId]?.positionedObjectProperties?.embeddedObject ?? undefined;
+}
+
+export function objectKind(e: docs_v1.Schema$EmbeddedObject | undefined): EmbeddedObjectInfo['kind'] {
+  if (e?.imageProperties) return 'image';
+  if (e?.embeddedDrawingProperties) return 'drawing';
+  return 'other';
+}
+
+const toPt = (d: docs_v1.Schema$Dimension | undefined): number | undefined =>
+  d?.magnitude == null ? undefined : Math.round(d.magnitude * 10) / 10;
+
+export function describeObject(tab: ObjectMaps, ref: Omit<ObjectRef, 'index'> & { index: number | null }): EmbeddedObjectInfo {
+  const e = embeddedObject(tab, ref.type, ref.objectId);
+  const layout =
+    ref.type === 'positioned'
+      ? tab.positionedObjects?.[ref.objectId]?.positionedObjectProperties?.positioning?.layout
+      : undefined;
+  const widthPt = toPt(e?.size?.width);
+  const heightPt = toPt(e?.size?.height);
+  return {
+    type: ref.type,
+    objectId: ref.objectId,
+    index: ref.index,
+    kind: objectKind(e),
+    ...(e?.title ? { title: e.title } : {}),
+    ...(e?.description ? { description: e.description } : {}),
+    ...(widthPt !== undefined ? { widthPt } : {}),
+    ...(heightPt !== undefined ? { heightPt } : {}),
+    ...(layout ? { layout } : {}),
+  };
+}
+
+function clip(s: string, n: number): string {
+  const flat = s.replace(/\s+/g, ' ').trim();
+  return flat.length > n ? `${flat.slice(0, n - 1)}…` : flat;
+}
+
+const cm = (pt: number) => (pt / 72) * 2.54;
+
+/** `[image: kix.abc, "alt text", 15.9×8.6 cm]` — what a reader sees in place of an object. */
+export function objectPlaceholder(o: EmbeddedObjectInfo): string {
+  const what = o.kind === 'image' ? 'image' : o.kind === 'drawing' ? 'drawing' : 'object';
+  const parts = [o.objectId];
+  const alt = [o.title, o.description].filter(Boolean).join(' — ');
+  if (alt) parts.push(JSON.stringify(clip(alt, 120)));
+  if (o.widthPt !== undefined && o.heightPt !== undefined) {
+    parts.push(`${cm(o.widthPt).toFixed(1)}×${cm(o.heightPt).toFixed(1)} cm`);
+  }
+  if (o.layout && o.layout !== 'POSITIONED_OBJECT_LAYOUT_UNSPECIFIED') {
+    parts.push(o.layout.toLowerCase().replace(/_/g, ' '));
+  }
+  return `[${o.type === 'positioned' ? 'positioned ' : ''}${what}: ${parts.join(', ')}]`;
+}
+
+type DisplayTab = Pick<TabInfo, 'inlineObjects' | 'positionedObjects' | 'footnotes'>;
+
+function footnoteText(tab: DisplayTab, id: string): string {
+  const content = tab.footnotes?.[id]?.content ?? [];
+  return content
+    .map((el) => (el.paragraph ? paragraphText(el.paragraph) : ''))
+    .join(' ')
+    .replace(new RegExp(OBJECT_CHAR, 'g'), '');
+}
+
+function elementPlaceholder(el: docs_v1.Schema$ParagraphElement, tab: DisplayTab): string | null {
+  const id = el.inlineObjectElement?.inlineObjectId;
+  if (id) {
+    return objectPlaceholder(describeObject(tab, { type: 'inline', objectId: id, index: el.startIndex ?? null }));
+  }
+  if (el.inlineObjectElement) return '[object]';
+  if (el.pageBreak) return '[page break]';
+  if (el.columnBreak) return '[column break]';
+  if (el.horizontalRule) return '[horizontal rule]';
+  if (el.equation) return '[equation]';
+  if (el.footnoteReference) {
+    const f = el.footnoteReference;
+    const body = f.footnoteId ? clip(footnoteText(tab, f.footnoteId), 300) : '';
+    return `[footnote ${f.footnoteNumber ?? '?'}${body ? `: ${body}` : ''}]`;
+  }
+  if (el.person) {
+    const p = el.person.personProperties;
+    const who = [p?.name, p?.email ? `<${p.email}>` : ''].filter(Boolean).join(' ');
+    return `[person${who ? `: ${who}` : ''}]`;
+  }
+  if (el.richLink) {
+    const r = el.richLink.richLinkProperties;
+    const what = [r?.title, r?.uri].filter(Boolean).join(' ');
+    return `[link${what ? `: ${what}` : ''}]`;
+  }
+  if (el.autoText) {
+    const t = el.autoText.type;
+    return t && t !== 'TYPE_UNSPECIFIED' ? `[${t.toLowerCase().replace(/_/g, ' ')}]` : '[auto text]';
+  }
+  return null;
+}
+
+/**
+ * A paragraph as a reader should see it: text, with a placeholder for every
+ * non-text element, then one line per object positioned on this paragraph.
+ */
+export function paragraphDisplay(p: docs_v1.Schema$Paragraph, tab: DisplayTab): string {
+  let s = '';
+  for (const el of p.elements ?? []) {
+    if (el.textRun?.content != null) {
+      s += el.textRun.content;
+      continue;
+    }
+    const placeholder = elementPlaceholder(el, tab);
+    if (placeholder) s += placeholder;
+    else s += OBJECT_CHAR.repeat(Math.max(0, (el.endIndex ?? 0) - (el.startIndex ?? 0)));
+  }
+  const positioned = p.positionedObjectIds ?? [];
+  if (positioned.length) {
+    if (!s.endsWith('\n')) s += '\n';
+    for (const id of positioned) {
+      s += `${objectPlaceholder(describeObject(tab, { type: 'positioned', objectId: id, index: null }))}\n`;
+    }
+  }
+  return s;
+}
+
+/**
+ * The text read_doc shows: like tabText, but with placeholders for images,
+ * drawings, footnotes and breaks, and the table of contents marked as such.
+ * Not for searching — use tabText / indexedText for that.
+ */
+export function tabDisplayText(tab: Pick<TabInfo, 'body'> & DisplayTab): string {
+  let s = '';
+  const walk = (content: docs_v1.Schema$StructuralElement[] | undefined) => {
+    for (const el of content ?? []) {
+      if (el.paragraph) s += paragraphDisplay(el.paragraph, tab);
+      for (const row of el.table?.tableRows ?? []) {
+        for (const cell of row.tableCells ?? []) walk(cell.content);
+      }
+      if (el.tableOfContents) {
+        s += '[table of contents]\n';
+        walk(el.tableOfContents.content);
+        s += '[end of table of contents]\n';
+      }
+    }
+  };
+  walk(tab.body?.content);
+  return s;
+}
+
+/**
+ * Every image and drawing of a tab, in document order, then any the body does
+ * not reference (they sit in a header, footer or footnote).
+ */
+export function tabObjects(tab: Pick<TabInfo, 'body' | 'lists'> & ObjectMaps): EmbeddedObjectInfo[] {
+  const out: EmbeddedObjectInfo[] = [];
+  const seen = new Set<string>();
+  for (const p of listParagraphs(tab)) {
+    for (const ref of p.objects ?? []) {
+      seen.add(ref.objectId);
+      out.push(describeObject(tab, ref));
+    }
+  }
+  for (const id of Object.keys(tab.inlineObjects ?? {})) {
+    if (!seen.has(id)) out.push(describeObject(tab, { type: 'inline', objectId: id, index: null }));
+  }
+  for (const id of Object.keys(tab.positionedObjects ?? {})) {
+    if (!seen.has(id)) out.push(describeObject(tab, { type: 'positioned', objectId: id, index: null }));
+  }
+  return out;
+}
+
+/** Finds an object by id in one tab or all of them. */
+export function findObject(
+  tabs: TabInfo[],
+  objectId: string,
+): { tab: TabInfo; type: 'inline' | 'positioned'; embedded: docs_v1.Schema$EmbeddedObject | undefined } | null {
+  for (const tab of tabs) {
+    if (tab.inlineObjects?.[objectId]) {
+      return { tab, type: 'inline', embedded: embeddedObject(tab, 'inline', objectId) };
+    }
+    if (tab.positionedObjects?.[objectId]) {
+      return { tab, type: 'positioned', embedded: embeddedObject(tab, 'positioned', objectId) };
+    }
+  }
+  return null;
 }
 
 /**
@@ -253,6 +513,12 @@ export function noMatchHints(needle: string): string[] {
     hints.push(
       'The text looks copied from a Markdown export (trailing double spaces or backslash ' +
         'escapes), which the document itself does not contain. Copy it from read_doc instead.',
+    );
+  }
+  if (/\[(positioned )?(image|drawing|object|footnote|page break|column break|horizontal rule|person|link|equation|footnote \S+)(:|\])/.test(needle)) {
+    hints.push(
+      'Bracketed placeholders such as [image: …] are how read_doc shows non-text elements; ' +
+        'they are not text in the document. Search for the text on either side instead.',
     );
   }
   if (/[\n]/.test(needle)) {

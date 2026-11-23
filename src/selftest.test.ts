@@ -859,6 +859,240 @@ test('list items know whether their list is numbered', async () => {
   assert.deepEqual(b!.list, { listId: 'L2', nestingLevel: 1, ordered: false });
 });
 
+/* Images, drawings and other non-text elements */
+
+// A tab shaped like the "Spanska åk 7" case: text around an inline image, and a
+// speech bubble positioned on the dialogue line, which occupies no index at all.
+function tabWithObjects() {
+  const body = {
+    content: [
+      { endIndex: 1, sectionBreak: {} },
+      {
+        startIndex: 1,
+        endIndex: 7,
+        paragraph: {
+          elements: [
+            { startIndex: 1, endIndex: 3, textRun: { content: 'ab' } },
+            { startIndex: 3, endIndex: 4, inlineObjectElement: { inlineObjectId: 'kix.inl' } },
+            { startIndex: 4, endIndex: 7, textRun: { content: 'cd\n' } },
+          ],
+        },
+      },
+      {
+        startIndex: 7,
+        endIndex: 16,
+        paragraph: {
+          elements: [{ startIndex: 7, endIndex: 16, textRun: { content: 'D - Hola\n' } }],
+          positionedObjectIds: ['kix.pos'],
+        },
+      },
+      {
+        startIndex: 16,
+        endIndex: 19,
+        paragraph: {
+          elements: [
+            { startIndex: 16, endIndex: 17, inlineObjectElement: { inlineObjectId: 'kix.drw' } },
+            { startIndex: 17, endIndex: 18, pageBreak: {} },
+            { startIndex: 18, endIndex: 19, textRun: { content: '\n' } },
+          ],
+        },
+      },
+    ],
+  };
+  const embedded = (extra: Record<string, unknown>, w: number, h: number) => ({
+    ...extra,
+    size: { width: { magnitude: w, unit: 'PT' }, height: { magnitude: h, unit: 'PT' } },
+  });
+  return {
+    tabId: 't.3',
+    title: 'Flik 3',
+    index: 0,
+    depth: 0,
+    parentTabId: null,
+    body,
+    lists: undefined,
+    inlineObjects: {
+      'kix.inl': {
+        objectId: 'kix.inl',
+        inlineObjectProperties: {
+          embeddedObject: embedded(
+            { title: 'Karta', description: 'Spaniens karta', imageProperties: { contentUri: 'https://img.test/inl' } },
+            72,
+            36,
+          ),
+        },
+      },
+      'kix.drw': {
+        objectId: 'kix.drw',
+        inlineObjectProperties: { embeddedObject: embedded({ embeddedDrawingProperties: {} }, 144, 72) },
+      },
+    },
+    positionedObjects: {
+      'kix.pos': {
+        objectId: 'kix.pos',
+        positionedObjectProperties: {
+          positioning: { layout: 'IN_FRONT_OF_TEXT' },
+          embeddedObject: embedded(
+            {
+              imageProperties: {
+                contentUri: 'https://img.test/pos',
+                cropProperties: { offsetLeft: 0.05 },
+              },
+            },
+            127.5,
+            212.8,
+          ),
+        },
+      },
+    },
+  } as never;
+}
+
+test('read_doc shows images, drawings and breaks as placeholders, positioned ones after their paragraph', async () => {
+  const { tabDisplayText, tabText, OBJECT_CHAR } = await import('./google/docsModel.js');
+  const tab = tabWithObjects();
+  assert.equal(
+    tabDisplayText(tab),
+    'ab[image: kix.inl, "Karta — Spaniens karta", 2.5×1.3 cm]cd\n' +
+      'D - Hola\n' +
+      '[positioned image: kix.pos, 4.5×7.5 cm, in front of text]\n' +
+      '[drawing: kix.drw, 5.1×2.5 cm][page break]\n',
+  );
+  // The searchable text is untouched: one U+FFFC per indexed object, nothing for positioned ones.
+  assert.equal(tabText(tab), `ab${OBJECT_CHAR}cd\nD - Hola\n${OBJECT_CHAR}${OBJECT_CHAR}\n`);
+});
+
+test('anchors right next to an image still match, at the same document index', async () => {
+  const { locate } = await import('./google/docs.js');
+  const { indexedText, listParagraphs, noMatchHints, OBJECT_CHAR } = await import('./google/docsModel.js');
+  const tab = tabWithObjects() as unknown as { body: unknown; inlineObjects: unknown; positionedObjects: unknown };
+  const doc = {
+    title: 'D',
+    revisionId: 'r1',
+    tabs: [{ tabProperties: { tabId: 't.3', title: 'Flik 3' }, documentTab: tab }],
+  } as never;
+
+  const cd = locate(doc, 'cd', {}).found[0]!;
+  assert.deepEqual([cd.match.startIndex, cd.match.endIndex], [4, 6]);
+  const hola = locate(doc, 'D - Hola', {}).found[0]!;
+  assert.equal(hola.match.startIndex, 7);
+  // A search across the image works exactly as before: through the U+FFFC.
+  assert.equal(locate(doc, `b${OBJECT_CHAR}c`, {}).found[0]!.match.startIndex, 2);
+  assert.equal(indexedText(listParagraphs(tab as never)).slice(1, 7), `ab${OBJECT_CHAR}cd\n`);
+  // Placeholder text copied from read_doc is not in the document, and the error says why.
+  assert.throws(() => locate(doc, '[image: kix.inl', {}), /placeholders/);
+  assert.equal(noMatchHints('Hola').length, 0);
+});
+
+test('positioned objects are listed with their anchor paragraph, in structure and per tab', async () => {
+  const { listParagraphs, tabObjects, describeObject } = await import('./google/docsModel.js');
+  const tab = tabWithObjects();
+  const paragraphs = listParagraphs(tab);
+  assert.deepEqual(paragraphs[0]!.objects, [{ type: 'inline', objectId: 'kix.inl', index: 3 }]);
+  assert.deepEqual(paragraphs[1]!.objects, [{ type: 'positioned', objectId: 'kix.pos', index: 7 }]);
+  assert.deepEqual(describeObject(tab, paragraphs[1]!.objects![0]!), {
+    type: 'positioned',
+    objectId: 'kix.pos',
+    index: 7,
+    kind: 'image',
+    widthPt: 127.5,
+    heightPt: 212.8,
+    layout: 'IN_FRONT_OF_TEXT',
+  });
+  assert.deepEqual(
+    tabObjects(tab).map((o) => [o.type, o.objectId, o.kind, o.index]),
+    [
+      ['inline', 'kix.inl', 'image', 3],
+      ['positioned', 'kix.pos', 'image', 7],
+      ['inline', 'kix.drw', 'drawing', 16],
+    ],
+  );
+  const { describeTabs } = await import('./google/docs.js');
+  const [summary] = describeTabs([tab]);
+  assert.equal(summary!.images, 2);
+  assert.equal(summary!.drawings, 1);
+});
+
+test('footnotes and the table of contents are shown, not dropped', async () => {
+  const { tabDisplayText } = await import('./google/docsModel.js');
+  const tab = {
+    body: {
+      content: [
+        {
+          startIndex: 1,
+          endIndex: 3,
+          tableOfContents: { content: [para(1, 'Kapitel\n')] },
+        },
+        {
+          startIndex: 9,
+          endIndex: 14,
+          paragraph: {
+            elements: [
+              { startIndex: 9, endIndex: 12, textRun: { content: 'Hej' } },
+              { startIndex: 12, endIndex: 13, footnoteReference: { footnoteId: 'f1', footnoteNumber: '1' } },
+              { startIndex: 13, endIndex: 14, textRun: { content: '\n' } },
+            ],
+          },
+        },
+      ],
+    },
+    footnotes: { f1: { footnoteId: 'f1', content: [para(0, ' Källa: boken\n')] } },
+  } as never;
+  assert.equal(
+    tabDisplayText(tab),
+    '[table of contents]\nKapitel\n[end of table of contents]\nHej[footnote 1: Källa: boken]\n',
+  );
+});
+
+test('get_doc_image fetches with the account credentials and refuses drawings and oversize images', async () => {
+  const { fetchDocImage, MAX_IMAGE_BYTES } = await import('./google/docs.js');
+  const { ServiceError } = await import('./serviceError.js');
+  const doc = {
+    title: 'D',
+    tabs: [{ tabProperties: { tabId: 't.3', title: 'Flik 3' }, documentTab: tabWithObjects() }],
+  };
+  const docs = { documents: { get: async () => ({ data: doc }) } } as never;
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+  const fetched: string[] = [];
+  const auth = (size?: number) =>
+    ({
+      request: async ({ url }: { url: string }) => {
+        fetched.push(url);
+        const bytes = size ? new Uint8Array(size) : png;
+        return { data: bytes.buffer, headers: { 'content-type': 'image/png' } };
+      },
+    }) as never;
+
+  const img = await fetchDocImage(docs, auth(), 'doc1', 'kix.pos');
+  assert.equal(img.mimeType, 'image/png');
+  assert.equal(img.bytes, 4);
+  assert.equal(img.data.toString('base64'), Buffer.from(png).toString('base64'));
+  assert.equal(img.object.type, 'positioned');
+  assert.equal(img.tabId, 't.3');
+  assert.deepEqual(img.crop, { offsetLeft: 0.05 });
+  assert.deepEqual(fetched, ['https://img.test/pos']);
+
+  await assert.rejects(() => fetchDocImage(docs, auth(), 'doc1', 'kix.drw'), (err: unknown) => {
+    assert.ok(err instanceof ServiceError);
+    assert.match((err as Error).message, /drawing.*get_drive_download_url/s);
+    return true;
+  });
+  await assert.rejects(() => fetchDocImage(docs, auth(), 'doc1', 'kix.nope'), /kix\.inl, kix\.pos, kix\.drw/);
+  await assert.rejects(() => fetchDocImage(docs, auth(), 'doc1', 'kix.inl', 't.x'), /no tab "t\.x"/);
+  await assert.rejects(
+    () => fetchDocImage(docs, auth(MAX_IMAGE_BYTES + 1), 'doc1', 'kix.inl'),
+    /get_drive_download_url/,
+  );
+});
+
+test('get_doc_image is registered and read_doc tells agents placeholders are not text', async () => {
+  const source = await readFile(new URL('./mcp/tools/docs.ts', import.meta.url), 'utf8');
+  assert.match(source, /'get_doc_image'/);
+  assert.match(source, /type: 'image' as const/);
+  const server = await readFile(new URL('./mcp/server.ts', import.meta.url), 'utf8');
+  assert.match(server, /get_doc_image/);
+});
+
 test('exact search finds every occurrence at its document index', async () => {
   const { findMatches } = await import('./google/docsModel.js');
   const m = findMatches('\u0000Hej hej\nhej', 'hej');

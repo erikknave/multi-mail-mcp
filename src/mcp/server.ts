@@ -85,7 +85,9 @@ function instructionsFor(user: User, available: Set<Capability>): string {
         'lists, **bold**, *italic*, ~~strike~~, [link](url); a line ending in \\ (or a ' +
         '\\v character) gives a soft line break inside the paragraph. Copy search text from ' +
         'read_doc, not from a Markdown export: list numbers are not text. format_doc_text ' +
-        'marks existing text (e.g. strikethrough + colour for a correction). Comments: ' +
+        'marks existing text (e.g. strikethrough + colour for a correction). Images and ' +
+        'drawings show in read_doc as [image: id, …] / [positioned image: …] placeholders — ' +
+        'not text, never search for them; call get_doc_image to see one. Comments: ' +
         'list_doc_comments, add_doc_comment (never anchored to a text range — the API ' +
         'cannot), reply_to_doc_comment, resolve_doc_comment.\n\n'
       : '') +

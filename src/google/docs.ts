@@ -5,7 +5,10 @@ import {
   appendPlan,
   buildInsertRequests,
   findMatches,
+  findObject,
   flattenTabs,
+  tabObjects,
+  type EmbeddedObjectInfo,
   indexedText,
   listParagraphs,
   noMatchHints,
@@ -49,7 +52,98 @@ export function describeTabs(tabs: TabInfo[]) {
     depth: t.depth,
     ...(t.parentTabId ? { parentTabId: t.parentTabId } : {}),
     characterCount: tabText(t).length,
+    ...objectCounts(t),
   }));
+}
+
+function objectCounts(t: TabInfo) {
+  const objects = tabObjects(t);
+  const images = objects.filter((o) => o.kind === 'image').length;
+  const drawings = objects.filter((o) => o.kind === 'drawing').length;
+  return { ...(images ? { images } : {}), ...(drawings ? { drawings } : {}) };
+}
+
+/* ------------------------------------------------------------------ *
+ * Images
+ * ------------------------------------------------------------------ */
+
+/** Beyond this the image is refused rather than sent: ~5 MB once base64-encoded. */
+export const MAX_IMAGE_BYTES = 3_750_000;
+
+export interface DocImage {
+  tabId: string;
+  tabTitle: string;
+  object: EmbeddedObjectInfo;
+  mimeType: string;
+  bytes: number;
+  data: Buffer;
+  /** Crop as stored in the document; the bytes are the uncropped original. */
+  crop?: docs_v1.Schema$CropProperties;
+}
+
+/**
+ * The bytes of an image in a Doc. contentUri is a short-lived URL tied to the
+ * requesting account, so it is fetched here, server-side, with that account's
+ * credentials, and never handed out. Drawings have no contentUri: the Docs API
+ * does not expose them as images at all.
+ */
+export async function fetchDocImage(
+  docs: docs_v1.Docs,
+  auth: OAuth2Client,
+  documentId: string,
+  objectId: string,
+  tabId?: string,
+): Promise<DocImage> {
+  const doc = await getDocument(docs, documentId);
+  const tabs = flattenTabs(doc);
+  const scope = tabId ? [pickTab(tabs, tabId)] : tabs;
+  const found = findObject(scope, objectId);
+  if (!found) {
+    const known = scope.flatMap((t) => tabObjects(t).map((o) => o.objectId));
+    throw new ServiceError(
+      `No image or drawing "${objectId}" in ${tabId ? 'that tab' : 'this document'}. ` +
+        (known.length
+          ? `Object ids there: ${known.slice(0, 20).join(', ')}${known.length > 20 ? ', …' : ''}.`
+          : 'It contains no images or drawings.') +
+        ' Ids appear in read_doc placeholders such as [image: kix.…].',
+    );
+  }
+  const info = tabObjects(found.tab).find((o) => o.objectId === objectId)!;
+  if (info.kind === 'drawing') {
+    throw new ServiceError(
+      `"${objectId}" is a drawing (Insert → Drawing), not an image. The Docs API does not ` +
+        'expose drawings as pictures, so it cannot be fetched here. To see it, export the ' +
+        'document as PDF with get_drive_download_url (exportAs "application/pdf") and look at ' +
+        'the page.',
+    );
+  }
+  const uri = found.embedded?.imageProperties?.contentUri;
+  if (!uri) {
+    throw new ServiceError(
+      `"${objectId}" has no image data Google will hand out (kind: ${info.kind}). Export the ` +
+        'document as PDF with get_drive_download_url to see it.',
+    );
+  }
+  const res = await auth.request<ArrayBuffer>({ url: uri, responseType: 'arraybuffer' });
+  const data = Buffer.from(res.data);
+  const mimeType = String(res.headers?.['content-type'] ?? 'image/png').split(';')[0]!.trim();
+  if (data.length > MAX_IMAGE_BYTES) {
+    throw new ServiceError(
+      `The image is ${Math.round(data.length / 1024)} kB, over the ${Math.round(MAX_IMAGE_BYTES / 1024)} kB ` +
+        'this tool returns. Export the document as PDF with get_drive_download_url instead.',
+    );
+  }
+  const crop = found.embedded?.imageProperties?.cropProperties;
+  const cropped = crop && Object.values(crop).some((v) => typeof v === 'number' && v !== 0);
+  return {
+    tabId: found.tab.tabId,
+    tabTitle: found.tab.title,
+    object: info,
+    mimeType,
+    bytes: data.length,
+    data,
+    ...(cropped ? { crop } : {}),
+  };
 }
 
 /** The named tab, or the first one. An unknown id lists the real ones. */
