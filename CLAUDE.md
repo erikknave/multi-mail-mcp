@@ -83,7 +83,7 @@ scope, and prefer an existing one that already covers the call.
 ## Tool descriptions are the interface
 
 They are what the model reads at the moment it decides. They are also the whole
-context cost — measured at ~17k tokens for 60 tools, and ~22k for 69 after the Docs expansion
+context cost — measured at ~17k tokens for 60 tools, and ~22k for 69 after the Docs expansion, still ~22k for 70 with get_doc_image
 (Nov 2026, tools/list JSON at ~3.6 chars/token), so a
 paragraph is roughly 60 tokens charged on every request.
 
@@ -109,6 +109,12 @@ is the Drive comments API. Things that cost time to learn:
   `buildInsertRequests` resets new paragraphs explicitly, then applies the
   requested formatting, and creates bullets last and last-first because
   `createParagraphBullets` consumes the leading tabs that encode nesting.
+- **Objects live outside the body.** An inline image is one index (U+FFFC in
+  `text`) referencing `inlineObjects`; a positioned image occupies no index and
+  is only an id in its anchor paragraph's `positionedObjectIds`. Both maps are
+  per tab (`documentTab`). `tabDisplayText()` is what readers see (placeholders);
+  `tabText()`/`indexedText()` are what searches and writes use — never mix them,
+  or indices shift.
 - **Index-based writes are pinned to the revision just read**
   (`readModifyWrite`). Never compute indices from one read and write them
   without `writeControl`.

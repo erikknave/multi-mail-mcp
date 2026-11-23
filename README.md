@@ -351,7 +351,7 @@ costs to describe, and a shorter list is one a model chooses from more
 accurately. So the Drive, Sheets and Docs tools appear once a Google mailbox is
 connected, the chat tools once a Microsoft or Slack one is, and a user with
 nothing connected sees only the three account tools — which is what tells them
-to connect an account. In tokens, the full surface is around 22k (69 tools); a
+to connect an account. In tokens, the full surface is around 22k (70 tools); a
 Microsoft-only user sees about 8.7k, and a user with no mailboxes about 0.8k.
 
 The endpoint is stateless, so the list is recomputed on every request and needs
@@ -382,7 +382,7 @@ before newly connected mailboxes bring their tools into view.
 `format_sheet_range`, `auto_resize_sheet_columns`, `set_sheet_layout`,
 `create_spreadsheet`
 
-**Docs** — `read_doc`, `list_doc_tabs`, `create_doc`, `create_doc_tab`,
+**Docs** — `read_doc`, `list_doc_tabs`, `get_doc_image`, `create_doc`, `create_doc_tab`,
 `append_to_doc`, `append_doc_heading`, `insert_doc_text`, `delete_doc_text`,
 `replace_doc_text`, `format_doc_text`
 
@@ -497,6 +497,39 @@ returns all tabs, each under a `=== Tab: … (tabId …) ===` header, and
 appends go to the first tab and searches (`insert_doc_text`, `delete_doc_text`,
 `format_doc_text`, `replace_doc_text`) cover every tab. `create_doc_tab` adds a
 tab, optionally nested under another and with initial content.
+
+**Images and other non-text elements.** The body of a Doc holds only
+references: an inline image is one index (an `inlineObjectElement`) pointing
+into the tab's `inlineObjects`, and an image *positioned* on the page (wrapped,
+in front of or behind text) occupies no index at all — it is an id in the
+`positionedObjectIds` of the paragraph it is anchored to, pointing into
+`positionedObjects`. `read_doc` used to turn every non-text element into U+FFFC
+and never looked at positioned objects, so no agent could see a speech-bubble
+picture floated next to a dialogue (Nov 2026). Now the text `read_doc` shows has
+placeholders:
+
+```
+ab[image: kix.inl, "title — alt text", 15.9×8.6 cm]cd
+D - La camiseta cuesta dos euros…
+[positioned image: kix.7kvq0v9kbmuy, 4.5×7.5 cm, in front of text]
+```
+
+— `[drawing: …]` for an embedded drawing, `[footnote 1: …]`, `[page break]`,
+`[person: …]`, `[link: …]`, and the table of contents between
+`[table of contents]` markers. `structure: true` lists each paragraph's
+`objects` (type, objectId, index, kind, title, description, size in pt, layout)
+and each tab's objects; `list_doc_tabs`/`tabs` count `images` and `drawings`.
+`get_doc_image` returns an image as MCP image content: its `contentUri` is a
+short-lived URL tied to the account, so the server fetches it with that
+account's credentials (limit ~3.7 MB). The bytes are the uncropped original; a
+crop set in the editor comes back as `crop`. Drawings have no image the Docs API
+will hand out — the tool says so and points to a PDF export.
+
+**Placeholders are display only.** Searching, anchoring and every write still
+work on the document's real text, where an inline object is one U+FFFC at its
+index and a positioned one is nothing. That is what keeps a string offset equal
+to a document index; showing `[image]` in the searchable text would shift every
+index after it. A search containing a placeholder fails with a hint saying so.
 
 **Editing model.** Text is located, never addressed by index:
 
